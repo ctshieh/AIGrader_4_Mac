@@ -3,7 +3,7 @@ name: Build Windows EXE
 on:
   push:
     branches: [ "main", "master" ]
-  workflow_dispatch:  # 允許手動按按鈕觸發
+  workflow_dispatch:
 
 jobs:
   build:
@@ -28,9 +28,18 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install pyinstaller
+        # 確保安裝編譯工具
+        pip install pyinstaller Cython wheel setuptools
+
+    # 🔥 [關鍵步驟] 執行全專案編譯
+    # 這步會把 services, ui, utils, database 全部變成 .pyd 並刪除 .py
+    - name: Compile All Modules with Cython
+      run: |
+        python build_cython.py
 
     - name: Build EXE with PyInstaller
+      # 注意：我們使用 --hidden-import 強制引入這些模組，以防 PyInstaller 分析不到二進位檔的依賴
+      # 但通常 PyInstaller 能自動抓到 .pyd
       run: |
         pyinstaller --noconfirm --onefile --windowed --name "MathGraderPro" `
           --copy-metadata streamlit `
