@@ -1,7 +1,6 @@
 # database/db_manager.py
 # -*- coding: utf-8 -*-
-# Module-Version: v2026.01.05-SQLite-Compat
-# Description: Replaced JSONB with generic JSON for SQLite compatibility.
+# Module-Version: 19.3.0 (Mac Native + High Performance SQLite)
 
 import os
 import json
@@ -15,7 +14,9 @@ import bcrypt
 import pandas as pd
 import pytz
 
-# [CRITICAL FIX] Use generic JSON type for SQLite compatibility
+# [CRITICAL] 引入路徑管理模組 (Mac 必備)
+from utils.paths import get_writable_path
+
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Float, Text, ForeignKey, desc, func, text, Date, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 import config
@@ -69,22 +70,28 @@ def ensure_breakdown_present(ai_output_json):
     _ensure_breakdown_node(ai_output_json)
 
 # ==============================================================================
-#  1. SQLAlchemy Setup (SQLite Compatible)
+#  1. SQLAlchemy Setup (Mac Native Path + High Perf Settings)
 # ==============================================================================
-# 預設使用 SQLite，除非環境變數指定了 PostgreSQL
-DEFAULT_DB = "sqlite:///./math_grader.db"
-DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB)
+# [Mac Fix] 使用 get_writable_path 確保資料庫存放在使用者可寫入的目錄
+# Mac: ~/Library/Application Support/MathGraderPro/math_grader.db
+DB_PATH = get_writable_path("math_grader.db")
+DATABASE_URL = f"sqlite:///{DB_PATH}"
 
+# [High Performance] 保留您指定的高並發設定
 engine = create_engine(
-    DATABASE_URL, 
-    pool_size=20, max_overflow=30, pool_pre_ping=True, pool_recycle=3600,
+    DATABASE_URL,
+    pool_size=20, 
+    max_overflow=30, 
+    pool_pre_ping=True, 
+    pool_recycle=3600,
     connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
 )
+
 SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
 Base = declarative_base()
 
 # ==============================================================================
-#  2. Data Models (Using generic JSON)
+#  2. Data Models
 # ==============================================================================
 
 @dataclass
@@ -132,7 +139,7 @@ class UserModel(Base):
     timezone = Column(String, default='Asia/Taipei')
     last_login = Column(DateTime)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    ai_memory_rules = Column(JSON) # [FIX] Generic JSON
+    ai_memory_rules = Column(JSON)
     custom_page_limit = Column(Integer, default=0)
     custom_exam_limit = Column(Integer, default=0)
     branding_logo_path = Column(Text)
@@ -152,7 +159,7 @@ class ExamModel(Base): # Legacy
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     title = Column(String, nullable=False)
     subject = Column(String)
-    content_json = Column(JSON, nullable=False) # [FIX] Generic JSON
+    content_json = Column(JSON, nullable=False)
     is_published = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
@@ -181,10 +188,10 @@ class QuestionModel(Base):
     content = Column(Text)
     score = Column(Integer, default=0)
     solution = Column(Text)
-    sub_questions = Column(JSON) # [FIX] Generic JSON
+    sub_questions = Column(JSON)
     tags = Column(String)
     is_public = Column(Boolean, default=True)
-    meta = Column(JSON) # [FIX] Generic JSON
+    meta = Column(JSON)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 class QuestionSetModel(Base):
@@ -212,8 +219,8 @@ class GradedExamModel(Base):
     student_name = Column(String)
     file_path = Column(String)
     score = Column(Float, default=0.0)
-    comment = Column(JSON) # [FIX] Generic JSON
-    ai_output_json = Column(JSON) # [FIX] Generic JSON
+    comment = Column(JSON)
+    ai_output_json = Column(JSON)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 class UsageLogModel(Base):
@@ -248,12 +255,20 @@ class PasswordResetModel(Base):
 # ==============================================================================
 
 def init_db():
+    # [Robustness] 確保 DB 資料夾存在 (防止 Mac 上資料夾未建立導致錯誤)
+    db_dir = os.path.dirname(DB_PATH)
+    if not os.path.exists(db_dir):
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Failed to create DB directory: {e}")
+
     Base.metadata.create_all(bind=engine)
+    
     # Admin User Init
     admin_user = os.getenv("ADMIN_USER", "admin")
     admin_pass = os.getenv("ADMIN_PASS", "admin123")
     
-    # 簡單檢查是否已存在，不執行複雜 ALTER (SQLite 不支援部分 ALTER)
     session = SessionLocal()
     try:
         exists = session.query(UserModel).filter_by(username=admin_user).first()
@@ -370,7 +385,6 @@ def get_user_weekly_page_count(user_id: int) -> int:
         try:
             # 簡化版：計算過去 7 天的總量 (SQLite/Postgres 通用)
             cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=7)
-            # 注意：SQLite 存儲時間為字串，直接比較可能需要注意格式，但在 SQLAlchemy ORM 層通常會處理
             sql = text("SELECT SUM(pages) FROM usage_logs WHERE user_id = :uid AND created_at >= :start")
             result = session.execute(sql, {"uid": user_id, "start": cutoff}).scalar()
             return int(result) if result else 0
@@ -431,13 +445,11 @@ def cleanup_old_data(days: int) -> int:
         targets = session.query(GradedExamModel.batch_id, GradedExamModel.user_id).filter(GradedExamModel.created_at < cutoff).distinct().all()
         count = 0
         for bid, uid in targets:
-            # 這裡簡單處理，實際應呼叫完整刪除邏輯
             session.query(GradedExamModel).filter_by(batch_id=bid).delete()
             count += 1
         session.commit()
         return count
 
-# ... (其餘與 Exam/Question 相關的 CRUD 函式請保留原樣，重點是 class 定義已改為 JSON)
 def get_sys_conf(key: str) -> Optional[str]:
     with SessionLocal() as session:
         c = session.get(SystemConfigModel, key)
@@ -458,12 +470,10 @@ def get_all_users() -> List[Dict]:
 
 def get_all_usage_stats() -> pd.DataFrame:
     with SessionLocal() as session:
-        # SQLite 語法微調
         sql = text("SELECT u.username, COUNT(l.id) as job_count, SUM(l.cost_usd) as total_cost FROM usage_logs l JOIN users u ON l.user_id = u.id GROUP BY u.username")
         return pd.read_sql(sql, session.bind)
 
 def get_batch_billing_stats(limit: int = 100) -> pd.DataFrame:
-    # 簡化版 Billing Stats (避開 PostgreSQL 的 ARRAY_AGG)
     with SessionLocal() as session:
         sql = text("""
             SELECT u.username, u.real_name, g.batch_id, COUNT(*) as student_count

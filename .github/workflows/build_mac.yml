@@ -1,0 +1,94 @@
+name: Build macOS Silicon App (DMG)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14 # 使用 Apple Silicon (M1) Runner，速度快且原生支援 arm64
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11' 
+
+    # 1. 安裝系統級工具 (create-dmg 用於製作安裝檔)
+    - name: Install System Tools
+      run: |
+        brew install create-dmg
+
+    # 2. 建立虛擬環境變數檔 (Mock .env)
+    # 打包時需要一個 .env 佔位，實際執行時會用不到 (因為路徑已切換到 App Support)
+    - name: Create .env file
+      run: |
+        echo "DATABASE_URL=sqlite:///./math_grader.db" > .env
+
+    # 3. 安裝 Python 套件
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller Cython wheel setuptools
+
+    # 4. 編譯源碼 (Cython) -> 產生 .so 檔
+    - name: Compile All Modules with Cython
+      run: |
+        python build_cython.py
+
+    # 5. 打包成 .app (Application Bundle)
+    # 注意：使用 --onedir 模式，這對 .app 來說啟動最快
+    # 關鍵參數：--target-arch arm64 (確保是 Silicon 架構)
+    # 關鍵參數：--icon "assets/branding_logo.png" (請確保檔案存在，或移除此行)
+    - name: Build .app with PyInstaller
+      run: |
+        pyinstaller --noconfirm --onedir --windowed --name "MathGraderPro" \
+          --target-arch arm64 \
+          --icon "assets/branding_logo.png" \
+          --copy-metadata streamlit \
+          --copy-metadata google-genai \
+          --collect-all streamlit \
+          --collect-all altair \
+          --hidden-import="sqlalchemy.sql.default_comparator" \
+          --hidden-import="pymupdf" \
+          --add-data "ui:ui" \
+          --add-data "services:services" \
+          --add-data "database:database" \
+          --add-data "utils:utils" \
+          --add-data ".env:." \
+          run.py
+
+    # 6. 製作 .dmg 安裝檔 (Drag-and-Drop Installer)
+    # 這步會把 dist/MathGraderPro.app 包裝成 MathGraderPro_Installer.dmg
+    - name: Create DMG Installer
+      run: |
+        # 進入產出目錄
+        cd dist
+        
+        # 建立 DMG
+        # 如果沒有 assets/branding_logo.png，請把 --volicon 和 --icon 參數拿掉
+        create-dmg \
+          --volname "MathGraderPro Installer" \
+          --volicon "../assets/branding_logo.png" \
+          --window-pos 200 120 \
+          --window-size 800 400 \
+          --icon-size 100 \
+          --icon "MathGraderPro.app" 200 190 \
+          --hide-extension "MathGraderPro.app" \
+          --app-drop-link 600 185 \
+          "MathGraderPro_Installer.dmg" \
+          "MathGraderPro.app"
+
+    # 7. 上傳最終成品 (Artifact)
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: MathGraderPro-MacOS-Silicon-DMG
+        path: dist/MathGraderPro_Installer.dmg
+        retention-days: 5
+

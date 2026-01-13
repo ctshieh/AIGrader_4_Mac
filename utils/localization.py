@@ -1,6 +1,6 @@
 # utils/localization.py
 # -*- coding: utf-8 -*-
-# Module-Version: 18.0.3 (Architecture Optimized)
+# Module-Version: 19.0.0 (Synced with App v19.3)
 
 import streamlit as st
 from .locales.zh_tw import STRINGS as zh_tw
@@ -16,10 +16,8 @@ LOCALES = {
     "fr": fr
 }
 
-# 2. 定義語言選項 (Single Source of Truth)
-# 這是全系統唯一的語言清單定義點
-# Key = 語言代碼 (存入 Session)
-# Value = 顯示名稱 (UI 選單用)
+# 2. [關鍵新增] 定義語言選項 (Single Source of Truth)
+# App v19.3.0 需要這個變數來產生側邊欄選單
 LANGUAGE_OPTIONS = {
     "zh_tw": "🇹🇼 繁體中文",
     "en": "🇺🇸 English",
@@ -27,41 +25,30 @@ LANGUAGE_OPTIONS = {
     "fr": "🇫🇷 Français"
 }
 
-# 3. 核心函式
 def get_current_lang():
-    """取得當前語言代碼，預設為 zh_tw"""
     if 'lang' not in st.session_state:
         st.session_state.lang = "zh_tw"
     return st.session_state.lang
 
 def set_language(lang_code):
-    """設定語言並寫入 Session"""
     if lang_code in LANGUAGE_OPTIONS:
         st.session_state.lang = lang_code
+        st.session_state["language"] = LANGUAGE_OPTIONS[lang_code] # 相容舊版
     else:
         st.session_state.lang = "zh_tw"
 
 def t(key, default=None):
-    """
-    翻譯函式
-    依照 Session 中的 'lang' 代碼來查找對應字串
-    """
-    # 1. 取得當前語言代碼 (例如 'en')
+    # 優先使用新的 lang code (zh_tw)
     code = get_current_lang()
-    
-    # 2. 取得該語言的字典
     bundle = LOCALES.get(code, {})
     
-    # 3. 查找 Key
     if key in bundle:
         return bundle[key]
     
-    # 4. Fallback (如果找不到，依序找 zh_tw -> en)
-    # 這是為了防止某些新 Key 尚未翻譯導致空白
+    # Fallback
     for fb in ["zh_tw", "en"]:
         fb_bundle = LOCALES.get(fb, {})
         if key in fb_bundle:
             return fb_bundle[key]
             
-    # 5. 真的找不到，回傳預設值或 Key 本身
     return default if default is not None else key

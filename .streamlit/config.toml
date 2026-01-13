@@ -1,0 +1,20 @@
+# .streamlit/config.toml
+[theme]
+# 這是 Apple 的標準藍色，用於按鈕和強調色
+primaryColor = "#007AFF"
+
+# 背景全白，符合 Mac 視窗內容區域
+backgroundColor = "#FFFFFF"
+
+# 側邊欄使用淺灰色，模仿 Finder 的側邊欄
+secondaryBackgroundColor = "#F5F5F7"
+
+# 文字顏色：深灰 (不是純黑，這樣閱讀比較舒適)
+textColor = "#1D1D1F"
+
+# 字體：Sans serif 在 Mac 上會自動對應到 "San Francisco" (系統字體)
+font = "sans serif"
+
+[server]
+headless = true
+enableCORS = false
