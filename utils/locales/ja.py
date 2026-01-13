@@ -4,6 +4,20 @@
 STRINGS = {
      "app_title": "AI 自動採点システム", 
         # --- [New] On-Premise / Institutional Branding ---
+    # --- [Missing Keys Fix] v18.0.1 Settings & Maintenance ---
+    "settings_general": "一般設定",
+    "lbl_language": "表示言語",
+    "settings_branding_title": "ブランド設定 (Branding)",
+    "settings_branding_hint": "ロゴのアップロードやQRコードURLを設定します。",
+    "lbl_upload_logo": "ロゴアップロード (PNG推奨)",
+    "lbl_marketing_url": "マーケティングURL (QR)",
+    "lbl_running_head": "ヘッダー文字 (Running Head)",
+    "btn_save_branding": "ブランド設定を保存",
+    "msg_save_success": "設定を保存しました！ページを更新してください。",
+    "settings_maintenance": "データメンテナンス",
+    "warn_maintenance": "警告：一時ファイルが完全に削除されます。",
+    "btn_clear_uploads": "アップロード一時ファイルを削除",
+    "btn_clear_outputs": "出力一時ファイルを削除",
     "err_byok_required": "BYOK_REQUIRED: APIキーが見つかりません。設定でGemini APIキーを構成してください。",
     "msg_byok_guide": "APIキーが設定されていません。「個人設定」ページでキーを入力し、AI機能を有効にしてください。",
     "msg_system_locked": "APIキーが設定されるまで、システム機能は現在ロックされています。",

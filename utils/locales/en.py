@@ -4,6 +4,20 @@
 STRINGS = {
     # --- [New] On-Premise / Institutional Branding ---
     "app_title": "AI Grading System",
+    # --- [Missing Keys Fix] v18.0.1 Settings & Maintenance ---
+    "settings_general": "General Settings",
+    "lbl_language": "Interface Language",
+    "settings_branding_title": "Institution Branding",
+    "settings_branding_hint": "Upload your logo and set the QR code link for exams.",
+    "lbl_upload_logo": "Upload Logo (PNG)",
+    "lbl_marketing_url": "Marketing URL (QR Code)",
+    "lbl_running_head": "Custom Running Head",
+    "btn_save_branding": "Save Branding Settings",
+    "msg_save_success": "Settings Saved! Refresh to see changes.",
+    "settings_maintenance": "System Maintenance",
+    "warn_maintenance": "Warning: This will permanently delete temp files.",
+    "btn_clear_uploads": "Clear Upload Cache",
+    "btn_clear_outputs": "Clear Output Cache",
     # [Exam Gen Labels]
         "lbl_total_score": "Total Score",
         "suffix_question_paper": " (Question Paper)",

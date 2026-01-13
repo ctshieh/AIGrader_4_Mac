@@ -4,6 +4,20 @@
 STRINGS = {
     # --- [New] On-Premise / Institutional Branding ---
     "app_title": "Système de Notation IA",
+    # --- [Missing Keys Fix] v18.0.1 Settings & Maintenance ---
+    "settings_general": "Paramètres Généraux",
+    "lbl_language": "Langue de l'interface",
+    "settings_branding_title": "Image de Marque (Branding)",
+    "settings_branding_hint": "Téléchargez votre logo et définissez le lien QR Code.",
+    "lbl_upload_logo": "Télécharger Logo (PNG)",
+    "lbl_marketing_url": "URL Marketing (QR Code)",
+    "lbl_running_head": "En-tête Personnalisé",
+    "btn_save_branding": "Enregistrer la Marque",
+    "msg_save_success": "Paramètres enregistrés ! Actualisez pour voir les changements.",
+    "settings_maintenance": "Maintenance du Système",
+    "warn_maintenance": "Attention : Ceci supprimera définitivement les fichiers temporaires.",
+    "btn_clear_uploads": "Effacer Cache Uploads",
+    "btn_clear_outputs": "Effacer Cache Sorties",
     ###Extrea
     "err_byok_required": "BYOK_REQUIRED: Clé API manquante. Veuillez configurer votre clé Gemini API dans les paramètres.",
     "msg_byok_guide": "Aucune clé API détectée. Veuillez vous rendre dans les 'Paramètres' pour activer les fonctionnalités IA.",
