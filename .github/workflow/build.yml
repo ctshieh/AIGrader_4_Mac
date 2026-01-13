@@ -3,7 +3,7 @@ name: Build Windows EXE
 on:
   push:
     branches: [ "main", "master" ]
-  workflow_dispatch:
+  workflow_dispatch:  # 允許手動按按鈕觸發
 
 jobs:
   build:
@@ -17,27 +17,20 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.11' 
-        # 建議用 3.10 或 3.11，3.12+ 在某些舊依賴上可能會有相容性警告
 
-    - name: Install Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        # 確保安裝 PyInstaller
-        pip install pyinstaller
-   
     - name: Create .env file
       run: |
         echo "DATABASE_URL=sqlite:///./math_grader.db" > .env
         echo "ADMIN_USER=admin" >> .env
         echo "ADMIN_PASS=admin123" >> .env
 
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
     - name: Build EXE with PyInstaller
-      # 這是最關鍵的一步：
-      # 1. --onefile: 打包成單一檔案
-      # 2. --additional-hooks-dir: 確保 streamlit hook 被載入
-      # 3. --copy-metadata: 解決 streamlit 找不到版本的問題
-      # 4. --add-data: 確保 config, ui, database 等模組被包進去
       run: |
         pyinstaller --noconfirm --onefile --windowed --name "MathGraderPro" `
           --copy-metadata streamlit `
