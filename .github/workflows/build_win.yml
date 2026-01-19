@@ -90,5 +90,5 @@ jobs:
         # 推送至新倉庫
         git add .
         git commit -m "Auto-deploy Windows build via SSH"
-        git remote add origin git@github.com:ctshieh/AIGrader_4_Mac.git
+        git remote add origin git@github.com:ctshieh/MathGrader_4_Win.git
         git push --force origin main
