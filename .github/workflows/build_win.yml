@@ -21,12 +21,12 @@ jobs:
     - name: Download and Setup Poppler for Windows
       shell: pwsh
       run: |
-        # 自動抓取 2026 年推薦的穩定版 Poppler Windows 二進位檔
+        # 2026 年穩定版 Poppler Windows 二進位檔
         $url = "https://github.com/ossy-dev/poppler-windows/releases/download/v24.08.0-0/Release-24.08.0-0.zip"
         Invoke-WebRequest -Uri $url -OutFile poppler.zip
         Expand-Archive poppler.zip -DestinationPath temp_poppler
         
-        # 整理至專案路徑，方便打包讀取
+        # 整理至專案路徑
         mkdir bin_win
         Move-Item -Path temp_poppler\Library\bin\* -Destination bin_win\
         Remove-Item poppler.zip
@@ -43,7 +43,7 @@ jobs:
 
     - name: Build EXE with PyInstaller
       run: |
-        # 注意：Windows 環境使用 ";" 分隔路徑，且 ` 為 PowerShell 的換行符
+        # 使用 ";" 分隔路徑，並使用 ` 為換行符
         pyinstaller --noconfirm --onedir --windowed --name "AI Grader Pro" `
           --add-data "bin_win;poppler_bin" `
           --add-data "fonts;fonts" `
@@ -51,23 +51,44 @@ jobs:
           --add-data "app.py;." `
           run_native.py
 
-    - name: Push to Windows Release Repo
+    - name: Setup SSH Agent
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+        # 請確保在主專案 Secrets 中設定了 SSH_PRIVATE_KEY
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    - name: Push to Windows Release Repo via SSH
       shell: pwsh
-      env:
-        # 自動調用您在 Settings > Secrets 裡存好的變數
-        API_TOKEN_GITHUB: ${{ secrets.GH_PAT }}
       run: |
-        # 進入打包完成的輸出目錄
+        # 進入打包產出的成品目錄
         cd "dist/AI Grader Pro"
         
-        # 初始化並推送到目標 Release 專案
+        # 預防首次連接 GitHub 的主機驗證問題
+        if (!(Test-Path "~/.ssh")) { mkdir "~/.ssh" }
+        ssh-keyscan github.com >> ~/.ssh/known_hosts
+        
+        # 初始化並建立說明文件
         git init
         git config user.name "ctshieh"
-        git config user.email "ctshieh@mail.tku.edu.tw"
+        git config user.email "ctshieh@gmail.com"
         git checkout -b main
         
-        git add .
-        git commit -m "Auto-build Windows Release from Main Repo: $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+        # 產生自動化 README
+        $readmeContent = @"
+        # AI Grader Pro - Windows Release
         
-        # 強制推送至 MathGrader_4_Win.git
-        git push --force "https://${{ env.API_TOKEN_GITHUB }}@github.com/ctshieh/MathGrader_4_Win.git" main
+        這是由 GitHub Actions 自動生成的 Windows 版本。
+        
+        ## 執行說明
+        1. 下載後解壓縮。
+        2. 執行 `AI Grader Pro.exe` 即可。
+        
+        *Build Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')*
+        "@
+        $readmeContent | Out-File -FilePath "README.md" -Encoding utf8
+        
+        # 推送至新倉庫
+        git add .
+        git commit -m "Auto-deploy Windows build via SSH"
+        git remote add origin git@github.com:ctshieh/AIGrader_4_Mac.git
+        git push --force origin main
