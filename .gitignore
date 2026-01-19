@@ -11,7 +11,8 @@ env/
 .env
 license.key
 *.pem
-
+win_deploy_key
+win_deploy_key.pub
 # 資料庫與上傳檔案 (本地測試資料不需上傳)
 *.db
 *.sqlite
