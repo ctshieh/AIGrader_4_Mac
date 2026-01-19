@@ -5,7 +5,140 @@ STRINGS = {
     # --- [New] On-Premise / Institutional Branding ---
 "app_title": "AI 智慧閱卷系統",
     ##Extra
-"settings_general": "一般設定",
+    "err_invalid_format": "檔案格式不正確，僅支援 PDF 文件。"
+    "app_name": "AI Grader for STEM",
+    "desc_secure_grading": "K-16 STEM AI 智慧命題、自動閱卷與學力診斷系統",
+    "footer_text": "AI Grader for STEM\\nPowered by @2026 Nexora Systems",
+    
+    # --- 系統授權設定 (修復 render_license_setup 硬編碼) ---
+    "hdr_license_setup": "🔐 系統授權設定 (System Activation)",
+    "msg_license_init": "請完成授權以啟動系統。",
+    "msg_copy_mid": "☝️ 請複製上方機器碼 (Machine ID) 提供給客服人員。",
+    "lbl_license_file": "授權檔案",
+    "btn_select_license": "開啟系統視窗選取 License",
+    "btn_select_logo": "開啟系統視窗選取 Logo",
+    "msg_license_imported": "License 已匯入！",
+    "msg_logo_imported": "Logo 已匯入！",
+
+    # --- 側邊欄與工作模式 ---
+    "mode_creator": "出卷中心",
+    "mode_grader": "閱卷中心",
+    "switch_mode": "切換工作模式",
+    "logout": "登出",   
+# --- [NEW] Portal View ---
+    "portal_header": "歡迎回來, {}",
+    "portal_sub": "請選擇您的工作區：",
+    "mode_creator_title": "出卷中心",
+    "mode_creator_desc": """
+    - 設計試卷、排版 LaTeX、編寫解答與評分標準。
+    - 支援 **AI 輔助出題 (Business)** 與歷年試卷管理。
+    """,
+    "mode_grader_title": "閱卷中心",
+    "mode_grader_desc": """
+    - 上傳掃描考卷、執行 AI 批改、生成統計報表。
+    - 支援高精準度水平閱卷與班級分析。
+    """,
+    "btn_enter_creator": "進入出卷模式",
+    "btn_enter_grader": "進入閱卷模式",
+    "plan_label": "方案等級",
+        # --- [NEW] Question Bank 3.0 (三層分類 & 編輯器) ---
+    "tab_q_list": "題目列表",
+    "tab_q_sets": "題組管理",
+    "tab_q_add": "新增題目",
+    
+    # Filter & Taxonomy
+    "lbl_filter": "條件篩選",
+    "lbl_classification": "分類設定",
+    "lbl_section": "小節",  # New Level
+    "lbl_difficulty": "難易度",
+    "lbl_keyword": "關鍵字搜尋",
+    
+    # Smart Input Options
+    "opt_create_new": "✏️ 自訂新項目...",
+    "lbl_new_subj": "輸入新科目名稱",
+    "lbl_new_chap": "輸入新章節名稱",
+    "lbl_new_sec": "輸入新小節名稱",
+    
+    # Cart & Actions
+    "lbl_cart": "已選題目",
+    "msg_cart_empty": "尚未選擇題目",
+    "btn_save_set": "存為題組",
+    "lbl_set_name": "題組名稱",
+    "lbl_desc": "描述",
+    "btn_confirm_save": "確認儲存",
+    "btn_clear": "清除選擇",
+    "lbl_showing": "顯示",
+    "lbl_items": "筆題目",
+    "msg_no_result": "沒有找到符合條件的題目。",
+    "lbl_uncategorized": "未分類",
+    "lbl_subs_count": "包含小題",
+    
+    # Sets Management
+    "header_my_sets": "我的題組",
+    "msg_no_sets": "您尚未建立任何題組。",
+    "lbl_select_set": "選擇題組",
+    "lbl_contains": "包含",
+    "lbl_qs": "題",
+    "btn_load_cart": "載入到暫存區",
+    "btn_del_set": "刪除題組",
+    "msg_loaded": "已載入暫存區！",
+    "msg_deleted": "已刪除",
+    "msg_saved": "已儲存",
+
+    # Add / Edit Question Editor
+    "header_add_q": "新增題目",
+    "header_edit_q": "編輯題目",
+    "lbl_content": "題目詳細內容",
+    "lbl_q_text": "題目敘述 (支援 LaTeX)",
+    "gen_type_label": "題型分類",
+    "gen_height_label": "作答區高度 (cm)",
+    "lbl_score": "分數",
+    "gen_subs_check": "包含子題",
+    "mode_choice": "🔹 選擇題模式",
+    "lbl_options": "選項 (每行一個)",
+    "mode_composite": "🔹 子題模式",
+    "lbl_layout_cols": "子題排列",
+    "lbl_sub_count": "子題數量",
+    "lbl_sub_q": "子題",
+    "lbl_media": "媒體附件",
+    "tab_upload_img": "上傳圖片",
+    "tab_tikz": "TikZ 代碼",
+    "lbl_img_file": "選擇圖片",
+    "lbl_tikz_code": "輸入 TikZ Code",
+    
+    # Editor Buttons
+    "btn_save": "儲存",
+    "btn_save_changes": "💾 儲存修改",
+    "btn_add_confirm": "💾 確認新增",
+    "btn_cancel": "取消",
+    
+    # New Messages
+    "err_no_title": "請輸入名稱",
+    "err_empty_content": "題目內容不能為空",
+    "err_missing_meta": "請完整填寫 科目、章節 與 小節",
+    "err_save_fail": "儲存失敗",
+    "msg_q_saved": "題目已儲存！",
+    "msg_add_success": "✅ 新增題目成功！",
+    "msg_update_success": "✅ 修改成功！",
+
+    # Types & Difficulty
+    "type_calc_normal": "計算題 (一般)",
+    "type_calc_large": "計算題 (大格)",
+    "type_choice": "選擇題 (Multiple Choice)",
+    "type_proof": "證明題 (Proof)",
+    "type_tf": "是非題 (True/False)",
+    "type_fill": "填充題 (Fill-in)",
+    "diff_easy": "🟢 簡單 (Easy)",
+    "diff_medium": "🟡 中等 (Medium)",
+    "diff_hard": "🔴 困難 (Hard)",
+        "msg_please_upload_first": "請先上傳試卷 PDF 檔案或貼上評分 JSON",
+    "hdr_grading_config": "評分設定",
+        "lbl_rubric_granularity": "評分細緻度",
+        "opt_gran_coarse": "精簡",
+        "opt_gran_standard": "標準",
+        "opt_gran_diagnostic": "診斷",
+        "help_granularity": "精簡：僅看關鍵公式與結果 | 標準：依配分自動拆解核心步驟 | 診斷：包含代數簡化等微小細節",
+    "settings_general": "一般設定",
     "lbl_language": "介面語言",
     "settings_branding_title": "機構品牌設定",
     "settings_branding_hint": "在此上傳您的補習班 Logo，並設定考卷上的 QR Code 連結。",
@@ -51,7 +184,6 @@ STRINGS = {
     "adv_quota_title": "自定義配額管理",
     "adv_quota_desc": "根據機構需求靈活分配資源，確保系統運行穩健。",
     "badge_exclusive_license": "機構專屬授權",
-    "desc_secure_grading": "專為學術研究與專業評分打造的受控環境",
     "stat_connected": "已連線",
     "stat_protected": "受保護",
     "lbl_net_status": "網路狀態",

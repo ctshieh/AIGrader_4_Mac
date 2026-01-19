@@ -1,11 +1,19 @@
 # services/pdf_report_worker.py
 # -*- coding: utf-8 -*-
-# Module-Version: v2026.01.13-Report-Link-Fix
+# Module-Version: v2026.01.22-Font-Fix
+#
+# Changes:
+# 1. [Font] Ported smart font detection logic from `exam_gen_service.py`.
+#    - Supports Portable mode (local fonts/ folder).
+#    - Fallbacks: cwTeX -> Noto Serif -> System Font.
+# 2. [LaTeX] Updated template to accept dynamic font configuration string.
 
 import matplotlib
 matplotlib.use('Agg')
 
 import os
+import sys  # [NEW]
+import platform # [NEW]
 import subprocess
 import tempfile
 import logging
@@ -29,11 +37,61 @@ logger = logging.getLogger(__name__)
 class PdfReportWorker:
     
     @staticmethod
+    def _get_font_config():
+        """
+        [Font Strategy]
+        偵測字型路徑，邏輯與 ExamGen 一致。
+        優先順序：Portable fonts/ (cwTeX > Noto) -> System cwTeX -> Fallback Name
+        """
+        if getattr(sys, 'frozen', False):
+            application_path = os.path.dirname(sys.executable)
+        else:
+            application_path = os.getcwd()
+            
+        local_fonts_dir = os.path.join(application_path, "fonts")
+        
+        # 定義目標：報告主要使用明體 (Serif)
+        target_font = "cwTeXQMing-Medium.ttf"
+        fallback_font = "NotoSerifTC-VariableFont_wght.ttf"
+
+        search_paths = [local_fonts_dir]
+
+        system = platform.system()
+        if system == "Darwin":
+            search_paths.append(os.path.expanduser("~/Library/Fonts"))
+            search_paths.append("/Library/Fonts")
+        elif system == "Windows":
+            search_paths.append("C:\\Windows\\Fonts")
+            search_paths.append(os.path.join(os.getenv("LOCALAPPDATA", ""), "Microsoft\\Windows\\Fonts"))
+        else:
+            search_paths.append("/usr/share/fonts/truetype/custom")
+            search_paths.append(os.path.expanduser("~/.local/share/fonts"))
+
+        # 1. 尋找 cwTeX Ming
+        for path in search_paths:
+            full_path = os.path.join(path, target_font)
+            if os.path.exists(full_path):
+                dir_path = path.replace("\\", "/") 
+                if not dir_path.endswith("/"): dir_path += "/"
+                # 回傳完整 LaTeX 指令格式
+                return f"[Path={dir_path}, AutoFakeBold=2.5, AutoFakeSlant=.2]{{{target_font}}}"
+
+        # 2. 尋找 Noto Serif (Fallback)
+        # 只在 local fonts 找，確保是我們發布的版本
+        noto_path = os.path.join(local_fonts_dir, fallback_font)
+        if os.path.exists(noto_path):
+            dir_path = local_fonts_dir.replace("\\", "/")
+            if not dir_path.endswith("/"): dir_path += "/"
+            return f"[Path={dir_path}, AutoFakeBold=2.5, AutoFakeSlant=.2]{{{fallback_font}}}"
+
+        # 3. System Fallback
+        return "{cwTeX Q Ming Medium}"
+
+    @staticmethod
     def _prepare_logo(target_dir, user=None):
         """準備 Logo"""
         target_path = os.path.join(target_dir, "logo.png")
         user_logo = getattr(user, 'branding_logo_path', None)
-        # 使用 os.getcwd() 確保在不同執行環境下能找到預設資源
         default_logo = os.path.join(os.getcwd(), "assets", "logo.png")
         
         if user_logo and os.path.exists(user_logo):
@@ -138,8 +196,8 @@ class PdfReportWorker:
         
         if not isinstance(q_stats_df, pd.DataFrame): q_stats_df = pd.DataFrame()
 
-        # [Config] 字型設定 (可根據環境變更)
-        main_font = "cwTeX Q Ming Medium"
+        # [MODIFIED] 取得動態字型設定
+        main_font_config = PdfReportWorker._get_font_config()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             PdfReportWorker._prepare_logo(tmpdir, user=user)
@@ -167,7 +225,8 @@ class PdfReportWorker:
 \usepackage{{xeCJK, graphicx, float, geometry, titlesec, xcolor, lastpage, fancyhdr}}
 \geometry{{top=2.5cm, bottom=2.5cm, left=2.5cm, right=2.5cm}}
 
-\setCJKmainfont[AutoFakeBold=2.5]{{{main_font}}} 
+% [MODIFIED] 使用動態注入的字型設定 (不寫死選項)
+\setCJKmainfont{main_font_config}
 
 \linespread{{1.2}}\selectfont 
 \XeTeXlinebreaklocale "zh"

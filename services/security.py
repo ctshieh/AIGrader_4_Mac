@@ -1,65 +1,56 @@
 # services/security.py
 # -*- coding: utf-8 -*-
-import hashlib
+# Module-Version: 19.7.0 (Strict Node-Locked Verification)
+
 import os
+import json
+import hashlib
 import platform
 import subprocess
-import json
+from datetime import datetime
 
-# 請確保這個 SALT 與 keygen.py 內的一模一樣
+# [CRITICAL] 商業機密 Salt (必須與 Keygen 一致)
 RAW_SALT = "MathAIGrader_Enterprise_2026_CTSHIEH!730208"
 SECRET_SALT = RAW_SALT.strip()
 
-def _get_windows_uuid():
+def get_machine_id():
+    """
+    取得 Mac 本機唯一硬體 UUID (統一轉小寫)
+    """
     try:
-        # Windows: 使用 wmic 抓取主機板 UUID
-        cmd = 'wmic csproduct get uuid'
-        return subprocess.check_output(cmd, shell=True).decode().split('\n')[1].strip().lower()
-    except:
-        return "unknown-win-uuid"
-
-def _get_mac_uuid():
-    try:
-        # [NEW] macOS: 使用 ioreg 抓取 IOPlatformUUID
+        # 使用 ioreg 指令抓取最底層的 IOPlatformUUID
         cmd = "ioreg -d2 -c IOPlatformExpertDevice | awk -F\\\" '/IOPlatformUUID/{print $(NF-1)}'"
         output = subprocess.check_output(cmd, shell=True).decode().strip().lower()
         if output:
             return output
-        return "unknown-mac-uuid"
-    except:
-        return "unknown-mac-uuid"
-
-def get_machine_id():
-    """
-    跨平台取得機器唯一碼 (Fingerprint)
-    """
-    system = platform.system()
+    except Exception:
+        pass
     
-    if system == "Windows":
-        return _get_windows_uuid()
-    elif system == "Darwin": # Darwin 代表 macOS
-        return _get_mac_uuid()
-    elif system == "Linux":
-        # Linux 通常讀取 machine-id
-        if os.path.exists("/etc/machine-id"):
-            with open("/etc/machine-id") as f: return f.read().strip().lower()
-        if os.path.exists("/var/lib/dbus/machine-id"):
-            with open("/var/lib/dbus/machine-id") as f: return f.read().strip().lower()
-            
-    return "generic-unknown-id"
+    # Fallback: 使用 system_profiler
+    try:
+        cmd = "system_profiler SPHardwareDataType | grep 'Hardware UUID' | awk '{print $3}'"
+        output = subprocess.check_output(cmd, shell=True).decode().strip().lower()
+        if output:
+            return output
+    except:
+        pass
+
+    return "unknown-mac-uuid"
 
 def get_fingerprint_for_ui():
-    """UI 顯示用的申請代碼"""
     return get_machine_id()
 
 def load_branding_title(base_dir=None):
+    """讀取 branding.conf 中的標題"""
     if base_dir is None: base_dir = os.getcwd()
-    conf_path = os.path.join(base_dir, "branding.conf")
-    # 同時檢查 App Support 目錄 (針對 Mac)
-    if not os.path.exists(conf_path):
+    
+    # 優先找 App Support (Mac Native)
+    try:
         from utils.paths import get_writable_path
         conf_path = get_writable_path("branding.conf")
-
+    except ImportError:
+        conf_path = os.path.join(base_dir, "branding.conf")
+    
     if os.path.exists(conf_path):
         try:
             with open(conf_path, "r", encoding="utf-8") as f:
@@ -68,31 +59,48 @@ def load_branding_title(base_dir=None):
     return None
 
 def verify_license_tier(license_path):
-    """回傳: (is_valid, message, plan, title)"""
+    """
+    嚴格驗證邏輯 (Strict Hash Check)
+    不允許 Personal 版跨機器使用
+    """
+    # 1. 預設值
     default_title = "Math AI Grader Pro"
+    current_mid = get_machine_id()
     
-    # 讀取 Title (優先讀取 branding.conf)
+    # 嘗試讀取 branding.conf 的標題 (如果有的話)
+    # 注意：Personal 版通常沒有 conf，所以會用 default_title
     base_dir = os.path.dirname(license_path)
     current_title = load_branding_title(base_dir) or default_title
     
     if not os.path.exists(license_path):
         return False, "License file missing", None, current_title
-        
+
+    # 2. 讀取 Key 檔案內容
     try:
         with open(license_path, "r") as f:
-            stored_key = f.read().strip().upper()
-    except Exception as e:
-        return False, f"Read Error: {e}", None, current_title
+            stored_hash = f.read().strip().upper()
+    except Exception:
+        return False, "License file corrupt", None, current_title
 
-    mid = get_machine_id()
+    # 3. 暴力比對 (因為 Hash 不可逆，我們試算兩種可能的情況)
+    # 我們假設 Keygen 產生時用了正確的 Title 和 UUID
     
-    # 驗證 Personal 與 Business
-    for plan in ["personal", "business"]:
-        # 雜湊邏輯：MachineID + Plan + Title + Salt
-        raw = f"{mid}|{plan}|{current_title}|{SECRET_SALT}"
-        calc_key = hashlib.sha512(raw.encode('utf-8')).hexdigest().upper()
-        
-        if calc_key == stored_key:
-            return True, "Valid", plan, current_title
-            
-    return False, f"Invalid License (MID: {mid})", None, default_title
+    # --- 情況 A: 驗證 Personal 版 ---
+    # 公式: SHA512( mid | personal | title | salt )
+    raw_personal = f"{current_mid}|personal|{current_title}|{SECRET_SALT}"
+    hash_personal = hashlib.sha512(raw_personal.encode('utf-8')).hexdigest().upper()
+    
+    if hash_personal == stored_hash:
+        return True, "Valid", "personal", current_title
+
+    # --- 情況 B: 驗證 Business 版 ---
+    # 公式: SHA512( mid | business | title | salt )
+    raw_business = f"{current_mid}|business|{current_title}|{SECRET_SALT}"
+    hash_business = hashlib.sha512(raw_business.encode('utf-8')).hexdigest().upper()
+    
+    if hash_business == stored_hash:
+        return True, "Valid", "business", current_title
+
+    # --- 驗證失敗 ---
+    # 通常是因為 UUID 不對 (換了電腦)，或是 Title 不對
+    return False, f"License Invalid (Hardware Mismatch). Machine ID: {current_mid}", None, current_title

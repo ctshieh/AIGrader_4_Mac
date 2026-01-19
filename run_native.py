@@ -1,0 +1,66 @@
+# run_native.py
+# -*- coding: utf-8 -*-
+# Description: Mac Native App Launcher (Modified for Compiled App)
+
+import sys
+import threading
+import time
+import signal
+import os
+import webview
+from streamlit.web import cli as stcli
+
+def patch_signal_handling():
+    current_thread = threading.current_thread()
+    if current_thread is not threading.main_thread():
+        signal.signal = lambda s, f: None
+
+def start_streamlit_background():
+    """在背景執行 Streamlit Server"""
+    patch_signal_handling()
+
+    # 2. 設定 Streamlit 啟動參數
+    sys.argv = [
+        "streamlit", 
+        "run", 
+        # [關鍵修改] 這裡改成 "main.py"，讓 Streamlit 執行這個殼
+        os.path.join(os.path.dirname(__file__), "main.py"), 
+        "--global.developmentMode=false", 
+        "--server.headless=true", 
+        "--server.port=8501",
+        "--server.address=127.0.0.1",
+        "--server.fileWatcherType=none",
+        "--browser.gatherUsageStats=false"
+    ]
+
+    print("🚀 Starting Streamlit (Compiled Mode)...")
+    try:
+        stcli.main()
+    except SystemExit:
+        pass
+    except Exception as e:
+        print(f"❌ Streamlit Error: {e}")
+
+def start_app():
+    t = threading.Thread(target=start_streamlit_background)
+    t.daemon = True 
+    t.start()
+
+    time.sleep(3)
+
+    webview.create_window(
+        "AI Grader Pro",       
+        "http://127.0.0.1:8501", 
+        width=1280, 
+        height=850,
+        resizable=True,
+        confirm_close=True,
+        text_select=True
+    )
+    
+    webview.start()
+    print("👋 App closed.")
+    sys.exit(0)
+
+if __name__ == '__main__':
+    start_app()
