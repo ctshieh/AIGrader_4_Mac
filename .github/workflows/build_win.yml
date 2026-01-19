@@ -1,0 +1,73 @@
+name: Build AI Grader Pro Windows (Python 3.13)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.13
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+
+    - name: Download and Setup Poppler for Windows
+      shell: pwsh
+      run: |
+        # 自動抓取 2026 年推薦的穩定版 Poppler Windows 二進位檔
+        $url = "https://github.com/ossy-dev/poppler-windows/releases/download/v24.08.0-0/Release-24.08.0-0.zip"
+        Invoke-WebRequest -Uri $url -OutFile poppler.zip
+        Expand-Archive poppler.zip -DestinationPath temp_poppler
+        
+        # 整理至專案路徑，方便打包讀取
+        mkdir bin_win
+        Move-Item -Path temp_poppler\Library\bin\* -Destination bin_win\
+        Remove-Item poppler.zip
+        Remove-Item -Recurse temp_poppler
+
+    - name: Install Python Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller Cython wheel setuptools
+
+    - name: Cython Compilation
+      run: python build_cython.py
+
+    - name: Build EXE with PyInstaller
+      run: |
+        # 注意：Windows 環境使用 ";" 分隔路徑，且 ` 為 PowerShell 的換行符
+        pyinstaller --noconfirm --onedir --windowed --name "AI Grader Pro" `
+          --add-data "bin_win;poppler_bin" `
+          --add-data "fonts;fonts" `
+          --add-data "assets;assets" `
+          --add-data "app.py;." `
+          run_native.py
+
+    - name: Push to Windows Release Repo
+      shell: pwsh
+      env:
+        # 自動調用您在 Settings > Secrets 裡存好的變數
+        API_TOKEN_GITHUB: ${{ secrets.GH_PAT }}
+      run: |
+        # 進入打包完成的輸出目錄
+        cd "dist/AI Grader Pro"
+        
+        # 初始化並推送到目標 Release 專案
+        git init
+        git config user.name "ctshieh"
+        git config user.email "ctshieh@mail.tku.edu.tw"
+        git checkout -b main
+        
+        git add .
+        git commit -m "Auto-build Windows Release from Main Repo: $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+        
+        # 強制推送至 MathGrader_4_Win.git
+        git push --force "https://${{ env.API_TOKEN_GITHUB }}@github.com/ctshieh/MathGrader_4_Win.git" main
