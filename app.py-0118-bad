@@ -1,0 +1,196 @@
+# Copyright (c) 2026 [謝忠村/Chung Tsun Shieh]. All Rights Reserved.
+# app.py
+# -*- coding: utf-8 -*-
+# Version: v2026.01.22-Classic-Menu-Restored
+# Description: 回歸 0115 版本的中央集權選單架構，並整合新功能與多國語言。
+
+import streamlit as st
+import base64
+import os
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+
+# 1. 核心模組匯入
+from database.db_manager import login_user
+from utils.localization import t, set_language
+import utils.helpers as helpers
+
+# 2. UI 視圖匯入
+from ui.login_view import render_login
+from ui.portal_view import render_portal
+from ui.dashboard_view import render_dashboard
+from ui.settings_view import render_settings
+from ui.history_view import render_history
+from ui.exam_gen_view import render_exam_generator
+# [NEW] 匯入新功能模組
+from ui.my_exams_view import render_my_exams_view
+from ui.question_bank_view import render_question_bank
+# [Optional] 解答編輯器 (若需要可啟用)
+# from ui.solution_editor_view import render_solution_editor
+
+# ==========================================
+# 第一步：環境優化 - 字體與標點符號預載
+# ==========================================
+def init_font_settings():
+    try:
+        pref_fonts = ['cwTeX Q Hei', 'Noto Sans CJK TC', 'PingFang HK', 'Heiti TC']
+        sys_fonts = [f.name for f in fm.fontManager.ttflist]
+        for f in pref_fonts:
+            if f in sys_fonts:
+                plt.rcParams['font.sans-serif'] = [f]
+                break
+        plt.rcParams['axes.unicode_minus'] = False
+    except:
+        pass
+
+init_font_settings()
+
+# ==========================================
+# 第二步：PDF 導覽注入
+# ==========================================
+def patched_display_pdf(file_input, height=750):
+    try:
+        col_back, col_info = st.columns([1, 4])
+        with col_back:
+            if st.button(f"⬅️ {t('btn_back', '返回')}", key="nav_pdf_back", type="primary"):
+                st.session_state.view_pdf_data = None
+                st.rerun()
+        with col_info:
+            st.caption(f"ℹ️ {t('pdf_preview_mode', '預覽模式')}")
+
+        data = file_input.getvalue() if hasattr(file_input, "getvalue") else file_input
+        base64_pdf = base64.b64encode(data).decode('utf-8')
+        
+        pdf_display = f'''
+            <div style="border:2px solid #1A365D; border-radius:12px; overflow:hidden; max-height:{height}px;">
+                <embed src="data:application/pdf;base64,{base64_pdf}" width="100%" height="{height}px" type="application/pdf" />
+            </div>'''
+        st.markdown(pdf_display, unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"PDF Error: {e}")
+
+helpers.display_pdf = patched_display_pdf
+
+# ==========================================
+# 主程式邏輯 (Classic Mode)
+# ==========================================
+def main():
+    st.set_page_config(page_title="NewEra Tools", page_icon="🎓", layout="wide")
+
+    # A. Session 狀態初始化
+    if "is_authenticated" not in st.session_state:
+        st.session_state["is_authenticated"] = False
+    if "user" not in st.session_state:
+        st.session_state["user"] = None
+    if "lang" not in st.session_state:
+        st.session_state["lang"] = "zh_tw"
+    if "view_pdf_data" not in st.session_state:
+        st.session_state.view_pdf_data = None
+
+    # B. 登入檢查
+    if not st.session_state["is_authenticated"]:
+        render_login()
+        return
+
+    user = st.session_state["user"]
+
+    # C. Portal 路由
+    if "app_mode" not in st.session_state:
+        render_portal(user)
+        return
+
+    app_mode = st.session_state["app_mode"]
+
+    # ==========================================
+    # D. 中央集權側邊欄 (The 0115 Way)
+    # ==========================================
+    with st.sidebar:
+        st.title("NewEra Tools")
+        st.markdown(f"👤 **{user.username}**")
+        st.caption(f"Mode: {app_mode.title()}")
+
+        # 1. 模式切換
+        if st.button(f"🔄 {t('btn_portal', '切換模式')}", use_container_width=True):
+            del st.session_state["app_mode"]
+            if "page_selection" in st.session_state: del st.session_state.page_selection
+            st.rerun()
+
+        st.markdown("---")
+
+        # 2. 定義選單結構 (Key, Function)
+        menu_items = []
+        
+        if app_mode == "creator":
+            # 出卷模式選單
+            menu_items.append(("menu_exam_gen", render_exam_generator))
+            menu_items.append(("menu_my_exams", render_my_exams_view))
+            menu_items.append(("menu_bank", render_question_bank))
+            # menu_items.append(("menu_solution", render_solution_editor)) # 若需要可啟用
+        else:
+            # 閱卷模式選單
+            menu_items.append(("menu_grading", render_dashboard))
+            menu_items.append(("menu_history", render_history))
+        
+        # 通用選單
+        menu_items.append(("menu_settings", render_settings))
+
+        # 3. 渲染 st.radio 選單
+        # 使用 format_func 進行多國語言翻譯
+        options = [item[0] for item in menu_items]
+        
+        # 狀態保持：避免 rerun 時選單重置
+        idx = 0
+        if "page_selection" in st.session_state:
+            if st.session_state.page_selection in options:
+                idx = options.index(st.session_state.page_selection)
+
+        selection = st.radio(
+            t("menu_title", "功能導覽"),
+            options,
+            index=idx,
+            format_func=lambda x: t(x), # 自動翻譯 Key -> Label
+            key="page_selection"
+        )
+
+        st.markdown("---")
+
+        # 4. 語系切換 (保留您的需求)
+        langs = {"zh_tw": "繁體中文", "en": "English", "ja": "日本語", "fr": "Français"}
+        current_lang_key = st.session_state.get("lang", "zh_tw")
+        if current_lang_key not in langs: current_lang_key = "zh_tw"
+        
+        new_lang = st.selectbox("Language", options=list(langs.keys()), 
+                                format_func=lambda x: langs[x],
+                                index=list(langs.keys()).index(current_lang_key))
+        
+        if new_lang != st.session_state.lang:
+            st.session_state.lang = new_lang
+            set_language(new_lang)
+            st.rerun()
+
+        # 5. 登出
+        if st.button(t("logout_btn", "登出"), use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
+
+        # 6. Brand Footer (From 0115)
+        st.markdown("""
+            <div style="margin-top: 20px; text-align: center; opacity: 0.7; font-size: 0.8rem;">
+                🚀 <b>Next_Gen Educational Tools</b><br>
+                Future of Intelligent Grading
+            </div>
+        """, unsafe_allow_html=True)
+
+    # ==========================================
+    # E. 頁面分流執行
+    # ==========================================
+    # 找到對應的渲染函數並執行
+    target_func = next((item[1] for item in menu_items if item[0] == selection), None)
+    
+    if target_func:
+        target_func(user)
+    else:
+        st.error(f"View not found for: {selection}")
+
+if __name__ == "__main__":
+    main()

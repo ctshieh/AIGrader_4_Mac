@@ -1,0 +1,89 @@
+# ui/portal_view.py
+# -*- coding: utf-8 -*-
+# Module-Version: 19.9.2 (Fully Localized Portal)
+
+import streamlit as st
+from utils.localization import t, set_language, LANGUAGE_OPTIONS
+
+def render_portal(user):
+    # 1. 側邊欄 (語言切換)
+    with st.sidebar:
+        st.title(f"{t('header_welcome', default='Welcome')}, {user.real_name}")
+        st.markdown("---")
+        
+        # 語言選擇
+        st.markdown(f"### 🌐 {t('lbl_language', default='Language')}")
+        lang_keys = list(LANGUAGE_OPTIONS.keys())
+        curr_lang = st.session_state.get("lang", "zh_tw")
+        
+        try: ix = lang_keys.index(curr_lang)
+        except: ix = 0
+        
+        new_lang = st.selectbox(
+            "Select Language", 
+            options=lang_keys, 
+            format_func=lambda x: LANGUAGE_OPTIONS[x], 
+            index=ix,
+            key="portal_lang_select",
+            label_visibility="collapsed"
+        )
+        # 切換語言後重整
+        if new_lang != curr_lang:
+            st.session_state["lang"] = new_lang
+            set_language(new_lang)
+            st.rerun()
+            
+        st.markdown("---")
+        if st.button(t("logout", default="Logout"), width="stretch"):
+            st.session_state.clear()
+            st.rerun()
+
+    # 2. 主畫面
+    st.markdown(f"## {t('header_welcome', default='Welcome back')}, {user.real_name} 👋")
+    # 修正：使用 t() 翻譯提示文字
+    msg_select = t("portal_select_msg", default="Please select your workspace:")
+    # 如果字典裡沒有 portal_select_msg，嘗試使用 switch_mode 或其他接近的
+    if msg_select == "portal_select_msg": msg_select = "Please select your workspace:"
+    st.caption(msg_select)
+    
+    st.markdown("---")
+    
+    c1, c2 = st.columns(2)
+    with c1:
+        with st.container():
+            st.markdown(f"### 📝 {t('mode_creator', default='Exam Creator')}")
+            # 嘗試抓取描述，若無則留空或顯示預設
+            desc = t("desc_creator", default="Design exams and manage question banks.")
+            st.info(desc)
+            
+            # 按鈕多語化
+            btn_text = t("enter_creator", default="Enter Creator Mode")
+            # 如果字典沒有 enter_creator，手動組裝
+            if btn_text == "enter_creator": btn_text = f"Enter {t('mode_creator', 'Creator Mode')}"
+            
+            if st.button(btn_text, key="btn_creator", width="stretch"):
+                st.session_state["app_mode"] = "creator"
+                st.session_state["page"] = "Exam Gen"
+                st.rerun()
+            
+    with c2:
+        with st.container():
+            st.markdown(f"### ⚖️ {t('mode_grader', default='Grading Center')}")
+            desc = t("desc_grader", default="Batch grade exams with AI.")
+            st.info(desc)
+            
+            btn_text = t("enter_grader", default="Enter Grader Mode")
+            if btn_text == "enter_grader": btn_text = f"Enter {t('mode_grader', 'Grading Mode')}"
+
+            if st.button(btn_text, key="btn_grader", type="primary", width="stretch"):
+                st.session_state["app_mode"] = "grader"
+                st.session_state["page"] = "Grading"
+                st.rerun()
+    
+    st.markdown("---")
+    # 底部狀態列
+    plan_label = t("admin_user_plan_label", default="Plan")
+    ready_label = t("system_ready", default="System Ready")
+    if ready_label == "system_ready": ready_label = "System Ready"
+    
+    st.caption(f"{plan_label}: **{getattr(user, 'plan', 'personal').title()}** | {ready_label}")

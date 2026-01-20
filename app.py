@@ -1,450 +1,289 @@
+# Copyright (c) 2026 [謝忠村/Chung Tsun Shieh]. All Rights Reserved.
 # app.py
 # -*- coding: utf-8 -*-
-# Module-Version: 19.3.0 (macOS Commercial Native: No Simplifications)
-# Description: 整合 Mac 原生路徑、完整 Cookie 管理、多主題引擎、首次啟動精靈、機構分級權限。
+# Module-Version: v2026.01.20-K16-Multilang-Final
 
 import streamlit as st
 import sys
-import html
-import logging
 import os
+import time
 import shutil
+import platform
+import subprocess
 from dotenv import load_dotenv
 
 # ==============================================================================
-# 1. 核心模組載入 (含防禦性檢查)
+# 1. 系統初始化
+# ==============================================================================
+st.set_page_config(
+    page_title="AI Grader for STEM", 
+    page_icon="📝", 
+    layout="wide", 
+    initial_sidebar_state="expanded" 
+)
+
+# ==============================================================================
+# 2. CSS 樣式 (完整保留原始視覺規範)
+# ==============================================================================
+st.markdown("""
+    <style>
+    [data-testid="stSidebar"] { color: #333333 !important; background-color: #FAFAFA; }
+    [data-testid="stSidebar"] p { font-size: 15px !important; color: #333333 !important; }
+    [data-testid="stSidebarCollapsedControl"] {
+        display: block !important; color: black !important;
+        background-color: rgba(200, 200, 200, 0.4) !important; 
+        border-radius: 0 8px 8px 0; z-index: 999999;
+    }
+    .mode-box {
+        background-color: #E6F2FF; border: 1px solid #CCE5FF; color: #0056b3;
+        padding: 12px; border-radius: 6px; margin-bottom: 12px;
+        font-weight: bold; display: flex; align-items: center; gap: 8px;
+    }
+    .support-btn {
+        width: 100%; background-color: white; border: 1px solid #dddddd;
+        border-radius: 20px; padding: 10px 0; color: #0066cc;
+        text-align: center; font-weight: bold; margin-top: 40px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05); cursor: default;
+    }
+    .license-card {
+        background-color: #ffffff; padding: 40px; border-radius: 10px;
+        border: 1px solid #e0e0e0; box-shadow: 0 8px 16px rgba(0,0,0,0.1);
+        text-align: center; max-width: 650px; margin: 40px auto;
+    }
+    .mid-box {
+        background-color: #f8f9fa; padding: 15px; border: 1px dashed #6c757d;
+        border-radius: 5px; font-family: monospace; font-size: 1.2em;
+        color: #d63384; margin: 20px 0; word-break: break-all;
+    }
+    .upload-area {
+        border: 1px solid #ddd; padding: 20px; border-radius: 8px;
+        background-color: #fafafa; text-align: center; margin-bottom: 20px;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# 3. 模組載入
 # ==============================================================================
 try:
-    # Mac 專用路徑管理
     from utils.paths import get_resource_path, get_writable_path
-    # 多國語言架構
-    from utils.localization import t, set_language, LANGUAGE_OPTIONS
-    # 安全與授權
-    from services.security import verify_license_tier, get_fingerprint_for_ui, load_branding_title
-    # 資料庫與設定
-    from database.db_manager import init_db, get_sys_conf
-    # 身份驗證
+    from utils.localization import t, LANGUAGE_OPTIONS, set_language
+    from services.security import verify_license_tier, get_fingerprint_for_ui
+    from database.db_manager import init_db, login_user
     from services.auth_service import validate_session, logout_user
+    from services.plans import get_plan_config
     
-    # UI 視圖模組
     from ui.login_view import render_login
     from ui.portal_view import render_portal
     from ui.dashboard_view import render_dashboard
     from ui.exam_gen_view import render_exam_generator
-    from ui.solution_editor_view import render_solution_editor
-    from ui.my_exams_view import render_my_exams_view
     from ui.history_view import render_history
     from ui.settings_view import render_settings
     from ui.admin_view import render_admin
+    from ui.my_exams_view import render_my_exams_view
+    from ui.question_bank_view import render_question_bank
     
-    # Mac 風格引擎
-    from utils.styles import apply_mac_style, render_mac_sidebar_footer
-
+    from utils.styles import apply_mac_style
+    import matplotlib.pyplot as plt
 except ImportError as e:
-    # 這是為了防止打包後缺少模組導致直接閃退 (Crash)，在畫面上顯示錯誤
-    st.error(f"❌ Critical Startup Error: Missing Module. {e}")
-    st.stop()
+    st.error(f"❌ Startup Error: {e}"); st.stop()
 
-# ==============================================================================
-# 2. 環境與路徑初始化 (Path Initialization)
-# ==============================================================================
-# 設定 Log 到可寫入的使用者目錄 (避免 Mac 權限錯誤)
-LOG_FILE = get_writable_path(os.path.join("logs", "app.log"))
-os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-    ],
-)
-
-# 定義關鍵檔案路徑
-# 1. License & Config: 存在使用者可寫入區 (~/Library/Application Support/...)
 LICENSE_PATH = get_writable_path("license.key")
-CONF_PATH = get_writable_path("branding.conf")
-
-# 2. Assets: 優先讀取使用者上傳的 (Writable)，沒有則讀取 App 內建的 (Resource)
-USER_ASSETS_DIR = get_writable_path("assets")
-if not os.path.exists(USER_ASSETS_DIR): 
-    os.makedirs(USER_ASSETS_DIR, exist_ok=True)
-
-# Logo 優先權邏輯：自訂 > 預設 > 無
-CUSTOM_LOGO_PATH = os.path.join(USER_ASSETS_DIR, "branding_logo.png")
-DEFAULT_LOGO_PATH = get_resource_path(os.path.join("assets", "branding_logo.png"))
-
-if os.path.exists(CUSTOM_LOGO_PATH):
-    LOGO_PATH = CUSTOM_LOGO_PATH
-elif os.path.exists(DEFAULT_LOGO_PATH):
-    LOGO_PATH = DEFAULT_LOGO_PATH
-else:
-    LOGO_PATH = None
-
-# 預設標題 (稍後會嘗試從 branding.conf 覆蓋)
-app_title = "Math AI Grader Pro"
-page_icon = LOGO_PATH if LOGO_PATH else "📝"
-
-# 嘗試讀取 Branding Title (支援機構改名)
-try:
-    # 傳入可寫入區的目錄，因為 branding.conf 在那裡
-    base_dir = os.path.dirname(LICENSE_PATH)
-    loaded_title = load_branding_title(base_dir)
-    if loaded_title:
-        app_title = loaded_title
-except Exception:
-    pass
-
-# 設定頁面 (必須是第一條 Streamlit 指令)
-st.set_page_config(
-    page_title=app_title,
-    page_icon=page_icon,
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# [UI Magic] 強制注入 Mac 風格 CSS (讀取 Session 中的主題)
-current_theme = st.session_state.get("theme", "專業商務 (Pro Blue)")
-apply_mac_style(current_theme)
+LOGO_PATH = get_writable_path("logo.png")
 
 # ==============================================================================
-# 3. 授權驗證與首次啟動精靈 (License Gatekeeper & Wizard)
+# 4. OS-Level File Dialog (Native Only - 確保 pywebview 穩定)
 # ==============================================================================
+def get_native_file(file_extensions=None, prompt="Select File"):
+    system = platform.system()
+    if system == "Darwin":
+        try:
+            type_str = ""
+            if file_extensions:
+                ext_list = ', '.join([f'"{ext}"' for ext in file_extensions])
+                type_str = f'of type {{{ext_list}}}'
+            script = f'''
+            tell application "System Events"
+                activate
+                set f to choose file with prompt "{prompt}" {type_str}
+                return POSIX path of f
+            end tell
+            '''
+            cmd = ['osascript', '-e', script]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode == 0:
+                path = result.stdout.decode('utf-8').strip()
+                if path: return [path] 
+            return None
+        except Exception as e:
+            st.error(f"System Dialog Error: {e}"); return None
+    else:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk(); root.withdraw(); root.wm_attributes('-topmost', 1)
+            filetypes = []
+            if file_extensions:
+                ext_str = " ".join([f"*.{ext}" for ext in file_extensions])
+                filetypes.append(("Allowed Files", ext_str))
+            filetypes.append(("All Files", "*.*"))
+            file_path = filedialog.askopenfilename(title=prompt, filetypes=filetypes)
+            root.destroy()
+            if file_path: return [file_path]
+            return None
+        except Exception as e:
+            st.error(f"Tkinter Error: {e}"); return None
+
+# ==============================================================================
+# 5. 授權與初始化頁面 (100% 多國語系整合)
+# ==============================================================================
+def render_license_setup(message=""):
+    st.markdown(f"""
+        <div class="license-card">
+            <h2>{t('hdr_license_setup', '🔐 系統授權設定')}</h2>
+            <p style="color: #666;">{message if message else t('msg_license_init', '請完成授權以啟動系統。')}</p>
+            <div class="mid-box">{get_fingerprint_for_ui()}</div>
+            <p><small>{t('msg_copy_mid', '☝️ 請複製上方機器碼提供給客服人員。')}</small></p>
+        </div>
+    """, unsafe_allow_html=True)
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.markdown('<div class="upload-area">', unsafe_allow_html=True)
+        st.subheader(f"📂 {t('lbl_license_file', '授權檔案')}")
+        if st.button(t('btn_select_license', '選取 License'), key="btn_lic_native", type="primary", use_container_width=True):
+            files = get_native_file(file_extensions=["key"], prompt=t('btn_select_license'))
+            if files:
+                shutil.copy(files[0], LICENSE_PATH)
+                st.toast(f"✅ {t('msg_license_imported', 'License 已匯入！')}")
+                time.sleep(1.5); st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="upload-area">', unsafe_allow_html=True)
+        st.subheader(f"🖼️ {t('settings_branding_title', '品牌 Logo')}")
+        if st.button(t('btn_select_logo', '選取 Logo'), key="btn_logo_native", use_container_width=True):
+            files = get_native_file(file_extensions=["png", "jpg"], prompt=t('btn_select_logo'))
+            if files:
+                shutil.copy(files[0], LOGO_PATH)
+                st.toast(f"✅ {t('msg_logo_imported', 'Logo 已匯入！')}")
+                time.sleep(1.5); st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
 def check_license_gatekeeper():
-    """
-    檢查授權檔。
-    如果不存在 -> 顯示「首次啟動精靈」(Setup Wizard)。
-    如果存在 -> 驗證有效性與方案 (Personal/Business)。
-    """
-    if not os.path.exists(LICENSE_PATH):
-        # --- Mac Style Setup Wizard ---
-        st.markdown("""<div style='text-align:center; padding:40px;'>""", unsafe_allow_html=True)
-        
-        if LOGO_PATH: 
-            st.image(LOGO_PATH, width=120)
-        
-        st.title("Welcome to Math AI Grader")
-        st.info("Setup Required: Please upload your license key to activate.")
-        
-        # 使用 Form 避免重複刷新
-        with st.form("setup_form"):
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.markdown("##### 1. License Key (Required)")
-                up_key = st.file_uploader("Upload `license.key`", type=["key"])
-            with col_b:
-                st.markdown("##### 2. Config (Optional)")
-                up_conf = st.file_uploader("Upload `branding.conf`", type=["conf", "json"])
-            
-            submitted = st.form_submit_button("🚀 Activate System", type="primary", use_container_width=True)
-            
-            if submitted:
-                if up_key:
-                    # 寫入檔案到隱藏的系統路徑
-                    try:
-                        with open(LICENSE_PATH, "wb") as f:
-                            f.write(up_key.getbuffer())
-                        
-                        if up_conf:
-                            with open(CONF_PATH, "wb") as f:
-                                f.write(up_conf.getbuffer())
-                                
-                        st.toast("✅ Activation Successful! Restarting...", icon="🎉")
-                        # 標記 Session 並重啟
-                        st.session_state["init_done"] = True
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"File Write Error: {e}")
-                else:
-                    st.error("⚠️ License key is required.")
-        
-        # 顯示 Machine ID 方便客戶複製
-        try: 
-            mid = get_fingerprint_for_ui()
-        except: 
-            mid = "Unknown"
-            
-        with st.expander("Show Machine ID (For Registration)"):
-            st.code(mid)
-            st.caption("Please send this ID to your administrator.")
-            
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.stop() # 停止執行後續代碼
-
-    # --- License Verification ---
+    if not os.path.exists(LICENSE_PATH): return False, "License missing."
     try:
         is_valid, message, plan, title = verify_license_tier(LICENSE_PATH)
-    except Exception as e:
-        is_valid, message, plan, title = False, str(e), None, None
+        if not is_valid: return False, message
+        st.session_state["SYSTEM_PLAN"] = plan
+        st.session_state["APP_TITLE"] = title
+        if "license_data" not in st.session_state: st.session_state["license_data"] = {"features": []}
+        return True, "OK"
+    except Exception as e: return False, str(e)
 
-    if not is_valid:
-        st.error(f"⛔ License Invalid: {message}")
-        st.warning("Please contact support or upload a valid license.")
-        
-        # 提供重置按鈕，防止因為壞掉的 Key 導致程式永遠打不開
-        if st.button("🗑️ Reset License (Delete & Retry)"):
-            try: 
-                if os.path.exists(LICENSE_PATH): os.remove(LICENSE_PATH)
-                if os.path.exists(CONF_PATH): os.remove(CONF_PATH)
-            except: pass
-            st.rerun()
-        st.stop()
-    
-    # 驗證通過，將關鍵資訊存入 Session
-    st.session_state["SYSTEM_PLAN"] = plan
-    st.session_state["APP_TITLE"] = title
-
-# 執行攔截
-check_license_gatekeeper()
+load_dotenv(); init_db()
 
 # ==============================================================================
-# 4. 主應用程式邏輯 (Main App Logic)
+# 6. 主應用程式邏輯 (四國語言動態驅動)
 # ==============================================================================
-load_dotenv()
-init_db() # 初始化 DB (路徑由 db_manager 透過 utils.paths 處理)
-
-# --- Cookie Manager (Full Robust Version) ---
-# 這裡不簡化，保留完整的錯誤處理，確保 Cookie 讀寫穩定
-_COOKIE_AVAILABLE = False
-_cookie_mgr = None
-
-try:
-    import extra_streamlit_components as stx  
-    _COOKIE_AVAILABLE = True
-except ImportError:
-    pass
-
-def _get_cookie_mgr():
-    global _cookie_mgr
-    if not _COOKIE_AVAILABLE: 
-        return None
-    if _cookie_mgr is None:
-        try: 
-            _cookie_mgr = stx.CookieManager(key="cookie_manager")
-        except Exception: 
-            _cookie_mgr = None
-    return _cookie_mgr
-
-def _cookie_ops(op, name, value=None):
-    """Cookie 操作封裝：get, set, delete"""
-    cm = _get_cookie_mgr()
-    if not cm: return None
-    try:
-        if op == "get": 
-            return cm.get(name)
-        elif op == "set": 
-            cm.set(name, value)
-        elif op == "delete": 
-            cm.delete(name)
-    except Exception: 
-        pass
-
 def main_app():
-    # 1. 初始化 Cookie Manager
-    _get_cookie_mgr()
-    
-    # 2. 初始化 Session State 變數
+    is_valid, msg = check_license_gatekeeper()
+    if not is_valid: render_license_setup(msg); st.stop()
+
     if "is_authenticated" not in st.session_state:
-        st.session_state.update({
-            "is_authenticated": False, 
-            "lang": "zh_tw",
-            "theme": "專業商務 (Pro Blue)"
-        })
+        st.session_state.update({"is_authenticated": False, "lang": "zh_tw"})
     
-    # 3. 自動登入檢查 (Auto Login via Cookie)
     if not st.session_state["is_authenticated"]:
-        token = st.session_state.get("session_token")
-        
-        # 如果 Session 沒 Token，試著從 Cookie 拿
-        if not token:
-            token = _cookie_ops("get", "session_token")
-            
-        if token:
-            user = validate_session(token)
-            if user:
-                st.session_state.update({"is_authenticated": True, "user": user})
-                # Refresh Cookie (延長效期)
-                _cookie_ops("set", "session_token", token)
-                # 確保 Token 也在 Session 中
-                st.session_state["session_token"] = token
-            else:
-                # Token 無效 (過期或被登出)，清理殘留
-                _cookie_ops("delete", "session_token")
-                st.session_state.pop("session_token", None)
+        render_login(); return
 
-    # 4. 登入畫面 (Login View)
-    if not st.session_state["is_authenticated"]:
-        if LOGO_PATH: 
-            st.image(LOGO_PATH, width=150)
-        render_login()
-        return
-
-    # 5. 登入後邏輯
     user = st.session_state["user"]
-    
-    # Portal 模式 (選擇身分/入口)
+    user.plan = st.session_state.get("SYSTEM_PLAN", "free")
+
     if "app_mode" not in st.session_state:
-        render_portal(user)
-        return
+        render_portal(user); return
 
     app_mode = st.session_state.app_mode
 
-    # ==========================================================================
-    # 5.1 側邊欄與導航 (Sidebar & Navigation)
-    # ==========================================================================
     with st.sidebar:
-        # A. Logo & User Info
-        if LOGO_PATH:
-            st.image(LOGO_PATH, use_container_width=True)
-            st.markdown(f"**Hi, {user.real_name}**")
-        else:
-            st.title(f"Hi, {user.real_name}")
+        st.subheader(f"Hi, {user.real_name or user.username}")
+        st.caption("Language / Langue")
+        
+        # [修復] 動態讀取四國語系選單
+        lang_display_names = list(LANGUAGE_OPTIONS.values())
+        curr_lang_name = st.session_state.get("language", lang_display_names[0])
+        sel_lang = st.selectbox("Lang", lang_display_names, index=lang_display_names.index(curr_lang_name), key="lang_sel", label_visibility="collapsed")
+        
+        # 反查並更新語系
+        reverse_map = {v: k for k, v in LANGUAGE_OPTIONS.items()}
+        target_code = reverse_map.get(sel_lang)
+        if target_code and target_code != st.session_state.get("lang"):
+            set_language(target_code); st.rerun()
 
-        # 顯示機構標題 (從 License/Config 讀取)
-        st.caption(f"{st.session_state.get('APP_TITLE', 'Math Grader')}")
+        mode_icon = "📝" if app_mode == "creator" else "📈"
+        mode_text = t("mode_creator") if app_mode == "creator" else t("mode_grader")
+        st.markdown(f'<div class="mode-box">{mode_icon} Mode: {mode_text}</div>', unsafe_allow_html=True)
         
-        st.markdown("---")
-
-        # B. Language Selector (使用 LANGUAGE_OPTIONS)
-        lang_keys = list(LANGUAGE_OPTIONS.keys())
-        curr_lang = st.session_state.get("lang", "zh_tw")
-        
-        # 安全取得 index
-        try: ix = lang_keys.index(curr_lang)
-        except: ix = 0
-        
-        new_lang = st.selectbox(
-            "Language", 
-            options=lang_keys, 
-            format_func=lambda x: LANGUAGE_OPTIONS[x], 
-            index=ix,
-            key="sidebar_lang_select"
-        )
-        if new_lang != curr_lang:
-            st.session_state["lang"] = new_lang
-            set_language(new_lang) # 同步更新 localization 模組狀態
-            st.rerun()
-
-        # C. Theme Selector (多主題切換)
-        theme_opts = ["專業商務 (Pro Blue)", "暗夜極簡 (Dark Elegant)", "溫暖紙張 (Warm Paper)"]
-        curr_theme = st.session_state.get("theme", "專業商務 (Pro Blue)")
-        
-        theme_display = {
-            "專業商務 (Pro Blue)": "🔵 Pro Blue (Light)",
-            "暗夜極簡 (Dark Elegant)": "🌑 Dark Elegant",
-            "溫暖紙張 (Warm Paper)": "📜 Warm Paper"
-        }
-        
-        new_theme = st.selectbox(
-            "Interface Theme", 
-            theme_opts, 
-            index=theme_opts.index(curr_theme) if curr_theme in theme_opts else 0,
-            format_func=lambda x: theme_display.get(x, x),
-            key="sidebar_theme_select"
-        )
-        
-        if new_theme != curr_theme:
-            st.session_state["theme"] = new_theme
-            st.rerun()
-
-        st.markdown("---")
-        
-        # D. Mode Switch (模式切換)
-        mode_label = t("mode_creator") if app_mode == "creator" else t("mode_grader")
-        st.info(f"Mode: {mode_label}")
-        if st.button(t("switch_mode"), use_container_width=True):
+        if st.button(f"🏠 {t('switch_mode')}", use_container_width=True, type="primary"):
             del st.session_state.app_mode
+            if "page_selection_clean" in st.session_state: del st.session_state.page_selection_clean
             st.rerun()
-            
-        st.markdown("---")
 
-        # E. Dynamic Menu Generation (動態選單)
-        menu = []
+        st.markdown("---")
+        
+        # 選單結構與標籤翻譯
         if app_mode == "creator":
-            st.caption(t("menu_header_creator"))
-            menu = [
-                ("menu_exam_gen", "Exam Gen"), 
-                ("menu_solution", "Solution Edit"), 
-                ("menu_my_exams", "My Exams")
+            menu_structure = [
+                ("menu_exam_gen", t("menu_exam_gen"), render_exam_generator),
+                ("menu_my_exams", t("menu_my_exams"), render_my_exams_view),
+                ("menu_bank", t("menu_bank"), render_question_bank),
+                ("menu_settings", t("menu_settings"), render_settings),
             ]
+            plan_config = get_plan_config(user.plan, st.session_state.get("license_data", {}).get("features", []))
+            if getattr(user, "is_admin", False) and plan_config.get("show_admin", False):
+                menu_structure.append(("menu_admin", t("menu_admin"), render_admin))
         else:
-            st.caption(t("menu_header_grader"))
-            menu = [
-                ("menu_grading", "Grading"), 
-                ("menu_history", "History")
+            menu_structure = [
+                ("menu_grading", t("menu_grading"), render_dashboard),
+                ("menu_history", t("menu_history"), render_history),
+                ("menu_settings", t("menu_settings"), render_settings),
             ]
-        
-        # 共用功能
-        menu.append(("menu_settings", "Settings"))
 
-        # [Strict Admin Logic] 嚴格限制：僅 Business Plan + Admin User 可見
-        current_plan = st.session_state.get("SYSTEM_PLAN", "personal")
-        is_user_admin = getattr(user, "is_admin", False)
+        # 導覽路由邏輯
+        raw_labels = [m[1] for m in menu_structure]
+        current_selection = st.session_state.get("page_selection_clean", raw_labels[0])
+        if current_selection not in raw_labels: current_selection = raw_labels[0]
+            
+        display_labels = [f"🔴 {lbl}" if lbl == current_selection else f"⚪ {lbl}" for lbl in raw_labels]
+        label_map = {d: m for d, m in zip(display_labels, menu_structure)}
         
-        if is_user_admin and current_plan == "business":
-            menu.append(("menu_admin", "Admin"))
-
-        # 渲染選單
-        opts = [m[0] for m in menu]
-        default_ix = 0
-        if "page" in st.session_state:
-            # 嘗試保持當前頁面
-            key = next((k for k,v in menu if v == st.session_state.page), None)
-            if key in opts: default_ix = opts.index(key)
-
-        sel = st.radio(
-            "Navigation", 
-            opts, 
-            index=default_ix, 
-            format_func=lambda x: t(x), 
-            label_visibility="collapsed"
-        )
+        sel = st.radio("Nav", display_labels, index=raw_labels.index(current_selection), label_visibility="collapsed", key="nav_radio")
+        selected_item = label_map[sel]
         
-        # 更新 Session State
-        page = next(m[1] for m in menu if m[0] == sel)
-        st.session_state.page = page
+        if st.session_state.get("page_selection_clean") != selected_item[1]:
+            st.session_state.page_selection_clean = selected_item[1]; st.rerun()
 
         st.markdown("---")
-        
-        # F. Logout
-        if st.button(t("logout"), use_container_width=True):
-            try: 
-                logout_user(st.session_state.get("session_token"))
-            except: pass
-            
-            _cookie_ops("delete", "session_token")
-            st.session_state.clear()
+        # [修復] 登出傳遞 Token 避免缺失錯誤
+        if st.button(t("logout"), use_container_width=True, type="secondary"):
+            logout_user(st.session_state.get("session_token"))
+            st.session_state.update({"is_authenticated": False, "user": None, "session_token": None})
             st.rerun()
-            
-        # G. Mac Style Sticky Footer
-        donation_url = get_sys_conf("donation_url") or "https://www.math.tku.edu.tw/"
-        btn_text = get_sys_conf("support_btn_text") or "Support Mathematics"
-        popover_html = get_sys_conf("support_html") or "Thanks for your support!"
-        render_mac_sidebar_footer(donation_url, btn_text, popover_html)
 
-    # ==========================================================================
-    # 5.2 頁面路由與權限檢查 (Routing & Access Control)
-    # ==========================================================================
-    if page == "Exam Gen": 
-        render_exam_generator(user)
-    elif page == "Solution Edit": 
-        render_solution_editor()
-    elif page == "My Exams": 
-        render_my_exams_view(user)
-    elif page == "Grading": 
-        render_dashboard(user)
-    elif page == "History": 
-        render_history(user)
-    elif page == "Settings": 
-        render_settings(user)
-    elif page == "Admin":
-        # 路由層級的雙重防護 (Double Check)
-        if is_user_admin and current_plan == "business": 
-            render_admin(user)
-        else: 
-            st.error("⛔ Access Denied: Business Plan Required.")
+        # [Branding] 指定 Footer 格式
+        st.markdown(f"""
+            <div class="support-btn">
+                <div style="font-size: 14px; color: #0066cc; font-weight: bold;">AI Grader for STEM</div>
+                <div style="font-size: 10px; color: #718096; margin-top: 2px;">Powered by @2026 Nexora Systems</div>
+            </div>
+        """, unsafe_allow_html=True)
 
-# Entry Point
-if __name__ == "__main__":
+    selected_item[2](user)
+
+#if __name__ == "__main__":
+#    main_app()
+def run():
+    """ 這就是對外的啟動接口 """
     main_app()
+
+if __name__ == "__main__":
+    # 這是為了讓您在本地開發測試時仍能直接執行 python app.py
+    run()

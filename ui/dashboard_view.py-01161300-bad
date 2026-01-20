@@ -1,0 +1,2134 @@
+# Copyright (c) 2026 [謝忠村/Chung Tsun Shieh]. All Rights Reserved.
+# This software is proprietary and confidential.
+# Unauthorized copying of this file, via any medium is strictly prohibited.
+# ui/dashboard_view.py
+# -*- coding: utf-8 -*-
+# Module-Version: v2026.01.12-UI-I18n-Selector
+# Description: 
+# 1. [I18n] Integrated new PromptService selector with localization support.
+# 2. [UX] Split Subject selection into Level -> Subject hierarchy.
+from __future__ import annotations
+
+import matplotlib
+matplotlib.use('Agg')
+
+import pandas as pd
+import zipfile
+import logging
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+import streamlit as st
+import pandas as pd
+import json, os, re, time, cv2, datetime, numpy as np
+import uuid
+import tempfile
+import base64
+import pytz
+from PIL import Image
+from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from google import genai
+from google.genai import types
+
+import config
+from database.db_manager import (
+    get_sys_conf, get_today_batch_count, save_batch_results,
+    get_user_weekly_page_count, User
+)
+from utils.localization import t
+from utils.helpers import pdf_to_images, split_pdf_by_pages
+from services.grading_service import GradingService
+from services.vision_service import VisionService
+from services.ai_service import generate_rubric, generate_class_analysis
+from services.report_service import (
+    merge_and_calculate_data, 
+    create_advanced_zip_report, 
+    generate_question_analysis_chart, 
+    generate_score_distribution_chart, 
+    analyze_questions_performance
+)
+from services.pdf_report_worker import PdfReportWorker
+from services.prompt_service import PromptService # [NEW] Import
+
+# ==============================================================================
+#  Global Helpers
+# ==============================================================================
+
+def render_subject_selector(key_prefix: str):
+    """
+    [NEW] Multi-level Subject Selector with I18n Support
+    Returns: internal_subject_key (str)
+    """
+    c1, c2 = st.columns(2)
+    
+    with c1:
+        # 1. Get Levels (Key, Display Label)
+        levels_data = PromptService.get_levels() 
+        level_map = {label: key for key, label in levels_data}
+        level_display_list = list(level_map.keys())
+
+        # Select Level
+        selected_level_label = st.selectbox(
+            t("lbl_grade_level", "Education Level"), 
+            level_display_list, 
+            index=0, 
+            key=f"{key_prefix}_level_ui"
+        )
+        internal_level_key = level_map[selected_level_label]
+    
+    with c2:
+        # 2. Get Subjects based on Level
+        subjects_data = PromptService.get_subjects_by_level(internal_level_key)
+        subj_map = {label: key for key, label in subjects_data}
+        subj_display_list = list(subj_map.keys())
+        
+        # Select Subject
+        selected_subj_label = st.selectbox(
+            t("subject_select"), 
+            subj_display_list, 
+            index=0, 
+            key=f"{key_prefix}_subj_ui"
+        )
+        internal_subject_key = subj_map[selected_subj_label]
+        
+    return internal_subject_key
+
+def _calculate_flash_cost(usage_metadata, model="gemini-2.5-flash"):
+    if not usage_metadata: return 0.0
+    rate_input = 0.075; rate_output = 0.30
+    if "pro" in model: rate_input = 1.25; rate_output = 5.00
+    in_t = getattr(usage_metadata, 'prompt_token_count', 0) or 0
+    out_t = getattr(usage_metadata, 'candidates_token_count', 0) or 0
+    return (in_t / 1_000_000 * rate_input) + (out_t / 1_000_000 * rate_output)
+
+def _safe_float(value, default=0.0):
+    if value is None: return default
+    try: return float(value)
+    except: return default
+
+def _normalize_id_ui(raw_id: str) -> str:
+    s = str(raw_id).strip().lower()
+    return re.sub(r'[^a-z0-9]', '', s)
+
+def _safe_json_loads(text: str):
+    if not isinstance(text, str) or not text.strip(): return None
+    try: return json.loads(text.strip())
+    except: pass
+    if m := re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE):
+        try: return json.loads(m.group(1))
+        except: pass
+    s_idx = text.find('{'); e_idx = text.rfind('}')
+    if s_idx != -1 and e_idx != -1 and e_idx > s_idx:
+        try: return json.loads(text[s_idx:e_idx+1])
+        except: pass
+    return None
+
+def _map_rubric_to_labels(rubric_json: dict) -> list[str]:
+    labels = []
+    if not rubric_json or "questions" not in rubric_json: return []
+    for q in rubric_json["questions"]:
+        pid = str(q.get("id", "Q?")).strip()
+        if "sub_questions" in q and isinstance(q["sub_questions"], list) and len(q["sub_questions"]) > 0:
+            for i, sub in enumerate(q["sub_questions"]):
+                sid = str(sub.get("id", "")).strip()
+                if sid.startswith(pid): labels.append(sid)
+                else:
+                    clean_sid = re.sub(r"[^0-9a-zA-Z]", "", sid)
+                    if not clean_sid: clean_sid = str(i+1)
+                    labels.append(f"{pid}-{clean_sid}")
+        else: labels.append(pid)
+    return labels
+
+def _generate_meaningful_batch_id(user) -> str:
+    clean_name = re.sub(r"[^a-zA-Z0-9]", "", user.username)
+    utc_now = datetime.datetime.now(datetime.timezone.utc)
+    target_tz_str = getattr(user, 'timezone', 'Asia/Taipei')
+    if not target_tz_str: target_tz_str = 'Asia/Taipei'
+    try: user_tz = pytz.timezone(target_tz_str)
+    except: user_tz = pytz.timezone('Asia/Taipei')
+    local_now = utc_now.astimezone(user_tz)
+    today_str = local_now.strftime("%Y%m%d")
+    count = get_today_batch_count(user.id)
+    return f"report_{clean_name}_{today_str}_{count + 1:02d}"
+
+def _save_student_pdf(batch_id: str, student_id: str, pdf_chunk) -> str:
+    path = os.path.join(config.SPLITS_DIR, batch_id)
+    os.makedirs(path, exist_ok=True)
+    safe_id = re.sub(r'[^a-zA-Z0-9\-_]', '', str(student_id))
+    if not safe_id: safe_id = "unknown"
+    f_path = os.path.join(path, f"{safe_id}.pdf")
+    with open(f_path, "wb") as f:
+        if hasattr(pdf_chunk, "getvalue"): f.write(pdf_chunk.getvalue())
+        else: f.write(pdf_chunk)
+    return f_path
+
+def _get_max_workers(user=None):
+    plan = "free"
+    if user and hasattr(user, 'plan') and user.plan:
+        plan = user.plan.lower().strip()
+    db_key = f"MAX_WORKERS_{plan.upper()}"
+    try:
+        db_val = get_sys_conf(db_key)
+        if db_val and str(db_val).isdigit(): return int(db_val)
+    except: pass
+    if hasattr(config, 'PLAN_MAX_WORKERS') and isinstance(config.PLAN_MAX_WORKERS, dict):
+        config_val = config.PLAN_MAX_WORKERS.get(plan)
+        if config_val: return int(config_val)
+    return getattr(config, 'DEFAULT_MAX_WORKERS', 3)
+
+def _identify_student_info(user, img_pil, ratio):
+    if not user.google_api_key: return None, None, 0.0
+    try:
+        if isinstance(img_pil, Image.Image): cv_img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        else: cv_img = img_pil
+        aligned = VisionService.align_document(cv_img)
+        crop = VisionService.extract_header_image(aligned, True, ratio)
+        cost = 0.0
+        if crop is not None and crop.size > 0:
+            pil_crop = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            img_byte_arr = BytesIO(); pil_crop.save(img_byte_arr, format='PNG')
+            client = genai.Client(api_key=user.google_api_key)
+            prompt = """
+            Identify the **Handwritten Name** (姓名) and **Student ID** (學號).
+            Output JSON: {"Student ID": "...", "Name": "..."}
+            If text is unclear or missing, use "Unknown".
+            """
+            resp = client.models.generate_content(
+                model='gemini-2.5-pro', 
+                contents=[prompt, types.Part.from_bytes(data=img_byte_arr.getvalue(), mime_type='image/png')], 
+                config={'response_mime_type': 'application/json'}
+            )
+            cost = _calculate_flash_cost(resp.usage_metadata, 'gemini-2.5-pro')
+            try:
+                text = resp.text.strip()
+                if text.startswith("```json"): text = text[7:-3]
+                d = json.loads(text)
+                sid = str(d.get("Student ID", "")).strip()
+                name = str(d.get("Name", "")).strip()
+                if sid.lower() in ["unknown", "none", "null"]: sid = ""
+                if name.lower() in ["unknown", "none", "null"]: name = ""
+                if not sid and not name: return None, None, cost
+                return sid, name, cost
+            except: pass
+    except Exception as e:
+        print(f"[Dashboard] Identity OCR Error: {e}")
+        return None, None, 0.0
+    return None, None, 0.0
+
+def display_pdf(pdf_input, height=600):
+    try:
+        if isinstance(pdf_input, bytes): base64_pdf = base64.b64encode(pdf_input).decode('utf-8')
+        elif isinstance(pdf_input, BytesIO): base64_pdf = base64.b64encode(pdf_input.getvalue()).decode('utf-8')
+        elif hasattr(pdf_input, "read"): base64_pdf = base64.b64encode(pdf_input.read()).decode('utf-8')
+        else: return
+        pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="{height}px" type="application/pdf" style="min-width: 400px; max-width: 100%; border: 1px solid #ddd; border-radius: 5px;"></iframe>'
+        st.markdown(pdf_display, unsafe_allow_html=True)
+    except Exception as e: st.error(f"{t('err_pdf_preview')}: {e}")
+
+def _find_max_score_in_rubric_json(rubric_json, q_id):
+    if not rubric_json or "questions" not in rubric_json: return None
+    target_norm = _normalize_id_ui(q_id)
+    for q in rubric_json["questions"]:
+        q_norm = _normalize_id_ui(q.get("id", ""))
+        if q_norm == target_norm:
+            return float(q.get("points", q.get("score", 0)))
+        if "sub_questions" in q:
+            for sub in q["sub_questions"]:
+                sub_norm = _normalize_id_ui(sub.get("id", ""))
+                def get_val(item): return float(item.get("points", item.get("score", 0)))
+                if sub_norm == target_norm: return get_val(sub)
+                if (q_norm + sub_norm) == target_norm: return get_val(sub)
+    return None
+
+def render_step_indicator(step):
+    steps = [t("step_1"), t("step_2"), t("step_3")]
+    html = '<div style="display: flex; justify-content: space-between; margin-bottom: 25px;">'
+    for i, name in enumerate(steps):
+        step_num = i + 1
+        is_finished = (step_num < step) or (step == 3 and step_num == 3)
+        is_active = (step_num == step)
+        if is_finished: color = "#28a745"; icon = "✓"; font_weight = "bold"
+        elif is_active: color = "#4B7BEC"; icon = str(step_num); font_weight = "bold"
+        else: color = "#999"; icon = str(step_num); font_weight = "normal"
+        html += f'''
+        <div style="text-align: center; color: {color}; font-weight: {font_weight};">
+            <div style="width: 32px; height: 32px; border-radius: 50%; background: {color}; color: #fff; display: flex; align-items: center; justify-content: center; margin: 0 auto 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">{icon}</div>
+            <div>{name}</div>
+        </div>'''
+    html += '</div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+# ==============================================================================
+#  STEP 1
+# ==============================================================================
+##### ui/dashboard_view.py
+# ui/dashboard_view.py
+# Copyright (c) 2026 [謝忠村/Chung Tsun Shieh]. All Rights Reserved.
+# This software is proprietary and confidential.
+# Unauthorized copying of this file, via any medium is strictly prohibited.
+
+# ui/dashboard_view.py
+# -*- coding: utf-8 -*-
+# Module-Version: v2026.01.12-UI-I18n-Selector
+# Description:
+# 1. [I18n] Integrated new PromptService selector with localization support.
+# 2. [UX] Split Subject selection into Level -> Subject hierarchy.
+
+from __future__ import annotations
+import matplotlib
+matplotlib.use('Agg')
+
+import pandas as pd
+import zipfile
+import logging
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+import streamlit as st
+import pandas as pd
+import json, os, re, time, cv2, datetime, numpy as np
+import uuid
+import tempfile
+import base64
+import pytz
+from PIL import Image
+from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from google import genai
+from google.genai import types
+
+import config
+from database.db_manager import (
+    get_sys_conf, get_today_batch_count, save_batch_results,
+    get_user_weekly_page_count, User
+)
+from utils.localization import t
+from utils.helpers import pdf_to_images, split_pdf_by_pages
+from services.grading_service import GradingService
+from services.vision_service import VisionService
+from services.ai_service import generate_rubric, generate_class_analysis
+from services.report_service import (
+    merge_and_calculate_data,
+    create_advanced_zip_report,
+    generate_question_analysis_chart,
+    generate_score_distribution_chart,
+    analyze_questions_performance
+)
+from services.pdf_report_worker import PdfReportWorker
+from services.prompt_service import PromptService # [NEW] Import
+
+# ==============================================================================
+#  Global Helpers
+# ==============================================================================
+
+def render_subject_selector(key_prefix: str):
+    """
+    [NEW] Multi-level Subject Selector with I18n Support
+    Returns: internal_subject_key (str)
+    """
+    c1, c2 = st.columns(2)
+    
+    with c1:
+        # 1. Get Levels (Key, Display Label)
+        levels_data = PromptService.get_levels()
+        level_map = {label: key for key, label in levels_data}
+        level_display_list = list(level_map.keys())
+
+        # Select Level
+        selected_level_label = st.selectbox(
+            t("lbl_grade_level", "Education Level"),
+            level_display_list,
+            index=0,
+            key=f"{key_prefix}_level_ui"
+        )
+        internal_level_key = level_map[selected_level_label]
+    
+    with c2:
+        # 2. Get Subjects based on Level
+        subjects_data = PromptService.get_subjects_by_level(internal_level_key)
+        subj_map = {label: key for key, label in subjects_data}
+        subj_display_list = list(subj_map.keys())
+        
+        # Select Subject
+        selected_subj_label = st.selectbox(
+            t("subject_select"),
+            subj_display_list,
+            index=0,
+            key=f"{key_prefix}_subj_ui"
+        )
+        internal_subject_key = subj_map[selected_subj_label]
+        
+    return internal_subject_key
+
+def _calculate_flash_cost(usage_metadata, model="gemini-2.5-flash"):
+    if not usage_metadata: return 0.0
+    rate_input = 0.075; rate_output = 0.30
+    if "pro" in model: rate_input = 1.25; rate_output = 5.00
+    in_t = getattr(usage_metadata, 'prompt_token_count', 0) or 0
+    out_t = getattr(usage_metadata, 'candidates_token_count', 0) or 0
+    return (in_t / 1_000_000 * rate_input) + (out_t / 1_000_000 * rate_output)
+
+def _safe_float(value, default=0.0):
+    if value is None: return default
+    try: return float(value)
+    except: return default
+
+def _normalize_id_ui(raw_id: str) -> str:
+    s = str(raw_id).strip().lower()
+    return re.sub(r'[^a-z0-9]', '', s)
+
+def _safe_json_loads(text: str):
+    if not isinstance(text, str) or not text.strip(): return None
+    try: return json.loads(text.strip())
+    except: pass
+    if m := re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE):
+        try: return json.loads(m.group(1))
+        except: pass
+    s_idx = text.find('{'); e_idx = text.rfind('}')
+    if s_idx != -1 and e_idx != -1 and e_idx > s_idx:
+        try: return json.loads(text[s_idx:e_idx+1])
+        except: pass
+    return None
+
+def _map_rubric_to_labels(rubric_json: dict) -> list[str]:
+    labels = []
+    if not rubric_json or "questions" not in rubric_json: return []
+    for q in rubric_json["questions"]:
+        pid = str(q.get("id", "Q?")).strip()
+        if "sub_questions" in q and isinstance(q["sub_questions"], list) and len(q["sub_questions"]) > 0:
+            for i, sub in enumerate(q["sub_questions"]):
+                sid = str(sub.get("id", "")).strip()
+                if sid.startswith(pid): labels.append(sid)
+                else:
+                    clean_sid = re.sub(r"[^0-9a-zA-Z]", "", sid)
+                    if not clean_sid: clean_sid = str(i+1)
+                    labels.append(f"{pid}-{clean_sid}")
+        else: labels.append(pid)
+    return labels
+
+def _generate_meaningful_batch_id(user) -> str:
+    clean_name = re.sub(r"[^a-zA-Z0-9]", "", user.username)
+    utc_now = datetime.datetime.now(datetime.timezone.utc)
+    target_tz_str = getattr(user, 'timezone', 'Asia/Taipei')
+    if not target_tz_str: target_tz_str = 'Asia/Taipei'
+    try: user_tz = pytz.timezone(target_tz_str)
+    except: user_tz = pytz.timezone('Asia/Taipei')
+    local_now = utc_now.astimezone(user_tz)
+    today_str = local_now.strftime("%Y%m%d")
+    count = get_today_batch_count(user.id)
+    return f"report_{clean_name}_{today_str}_{count + 1:02d}"
+
+def _save_student_pdf(batch_id: str, student_id: str, pdf_chunk) -> str:
+    path = os.path.join(config.SPLITS_DIR, batch_id)
+    os.makedirs(path, exist_ok=True)
+    safe_id = re.sub(r'[^a-zA-Z0-9\-_]', '', str(student_id))
+    if not safe_id: safe_id = "unknown"
+    f_path = os.path.join(path, f"{safe_id}.pdf")
+    with open(f_path, "wb") as f:
+        if hasattr(pdf_chunk, "getvalue"): f.write(pdf_chunk.getvalue())
+        else: f.write(pdf_chunk)
+    return f_path
+
+def _get_max_workers(user=None):
+    plan = "free"
+    if user and hasattr(user, 'plan') and user.plan:
+        plan = user.plan.lower().strip()
+    db_key = f"MAX_WORKERS_{plan.upper()}"
+    try:
+        db_val = get_sys_conf(db_key)
+        if db_val and str(db_val).isdigit(): return int(db_val)
+    except: pass
+    if hasattr(config, 'PLAN_MAX_WORKERS') and isinstance(config.PLAN_MAX_WORKERS, dict):
+        config_val = config.PLAN_MAX_WORKERS.get(plan)
+        if config_val: return int(config_val)
+    return getattr(config, 'DEFAULT_MAX_WORKERS', 3)
+
+def _identify_student_info(user, img_pil, ratio):
+    if not user.google_api_key: return None, None, 0.0
+    try:
+        if isinstance(img_pil, Image.Image): cv_img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        else: cv_img = img_pil
+        aligned = VisionService.align_document(cv_img)
+        crop = VisionService.extract_header_image(aligned, True, ratio)
+        cost = 0.0
+        if crop is not None and crop.size > 0:
+            pil_crop = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            img_byte_arr = BytesIO(); pil_crop.save(img_byte_arr, format='PNG')
+            client = genai.Client(api_key=user.google_api_key)
+            prompt = """
+            Identify the **Handwritten Name** (姓名) and **Student ID** (學號).
+            Output JSON: {"Student ID": "...", "Name": "..."}
+            If text is unclear or missing, use "Unknown".
+            """
+            resp = client.models.generate_content(
+                model='gemini-2.5-pro',
+                contents=[prompt, types.Part.from_bytes(data=img_byte_arr.getvalue(), mime_type='image/png')],
+                config={'response_mime_type': 'application/json'}
+            )
+            cost = _calculate_flash_cost(resp.usage_metadata, 'gemini-2.5-pro')
+            try:
+                text = resp.text.strip()
+                if text.startswith("```json"): text = text[7:-3]
+                d = json.loads(text)
+                sid = str(d.get("Student ID", "")).strip()
+                name = str(d.get("Name", "")).strip()
+                if sid.lower() in ["unknown", "none", "null"]: sid = ""
+                if name.lower() in ["unknown", "none", "null"]: name = ""
+                if not sid and not name: return None, None, cost
+                return sid, name, cost
+            except: pass
+    except Exception as e:
+        print(f"[Dashboard] Identity OCR Error: {e}")
+        return None, None, 0.0
+    return None, None, 0.0
+
+def display_pdf(pdf_input, height=600):
+    try:
+        if isinstance(pdf_input, bytes): base64_pdf = base64.b64encode(pdf_input).decode('utf-8')
+        elif isinstance(pdf_input, BytesIO): base64_pdf = base64.b64encode(pdf_input.getvalue()).decode('utf-8')
+        elif hasattr(pdf_input, "read"): base64_pdf = base64.b64encode(pdf_input.read()).decode('utf-8')
+        else: return
+        pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="{height}px" type="application/pdf" style="min-width: 400px; max-width: 100%; border: 1px solid #ddd; border-radius: 5px;"></iframe>'
+        st.markdown(pdf_display, unsafe_allow_html=True)
+    except Exception as e: st.error(f"{t('err_pdf_preview')}: {e}")
+
+def _find_max_score_in_rubric_json(rubric_json, q_id):
+    if not rubric_json or "questions" not in rubric_json: return None
+    target_norm = _normalize_id_ui(q_id)
+    for q in rubric_json["questions"]:
+        q_norm = _normalize_id_ui(q.get("id", ""))
+        if q_norm == target_norm:
+            return float(q.get("points", q.get("score", 0)))
+        if "sub_questions" in q:
+            for sub in q["sub_questions"]:
+                sub_norm = _normalize_id_ui(sub.get("id", ""))
+                def get_val(item): return float(item.get("points", item.get("score", 0)))
+                if sub_norm == target_norm: return get_val(sub)
+                if (q_norm + sub_norm) == target_norm: return get_val(sub)
+    return None
+
+def render_step_indicator(step):
+    steps = [t("step_1"), t("step_2"), t("step_3")]
+    html = '<div style="display: flex; justify-content: space-between; margin-bottom: 25px;">'
+    for i, name in enumerate(steps):
+        step_num = i + 1
+        is_finished = (step_num < step) or (step == 3 and step_num == 3)
+        is_active = (step_num == step)
+        if is_finished: color = "#28a745"; icon = "✓"; font_weight = "bold"
+        elif is_active: color = "#4B7BEC"; icon = str(step_num); font_weight = "bold"
+        else: color = "#999"; icon = str(step_num); font_weight = "normal"
+        html += f'''
+        <div style="text-align: center; color: {color}; font-weight: {font_weight};">
+            <div style="width: 32px; height: 32px; border-radius: 50%; background: {color}; color: #fff; display: flex; align-items: center; justify-content: center; margin: 0 auto 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">{icon}</div>
+            <div>{name}</div>
+        </div>'''
+    html += '</div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+# ==============================================================================
+#  STEP 1
+# ==============================================================================
+##### ui/dashboard_view.py
+# ui/dashboard_view.py
+#####
+# ui/dashboard_view.py
+
+def render_step_1_rubric(user):
+    st.header(t("step_1"))
+    ss = st.session_state
+    
+    # --- 1. 狀態初始化 ---
+    EDITOR_KEY = "rubric_editor_fixed"      # 存放資料的 Key
+    WIDGET_KEY = "main_rubric_text_area"    # 綁定 UI 的 Key
+    
+    if EDITOR_KEY not in ss: ss[EDITOR_KEY] = ""
+    if "rubric_granularity" not in ss: ss["rubric_granularity"] = "標準"
+
+    # [清空回呼] 解決按鈕無效問題
+    def _clear_cb():
+        ss[EDITOR_KEY] = ""
+        ss[WIDGET_KEY] = ""
+
+    # --- 2. 參數選擇區 ---
+    subj_key = render_subject_selector("rubric_gen") 
+    st.markdown("---")
+
+    st.subheader("🎯 " + t("hdr_grading_config", "評分設定"))
+    gran_options = ["精簡", "標準", "診斷"]
+    selected_gran = st.select_slider(
+        t("lbl_rubric_granularity", "評分細緻度"),
+        options=gran_options,
+        value=ss.get("rubric_granularity", "標準")
+    )
+    ss["rubric_granularity"] = selected_gran
+    st.markdown(" ")
+
+    # --- 3. 上傳與生成區 ---
+    col_up, col_ai = st.columns([1, 1])
+    with col_up:
+        up = st.file_uploader(t("upload_rubric_label"), type=["pdf"], key="rub_up")
+    
+    with col_ai:
+        if up:
+            if st.button(t("ai_gen_rubric"), type="primary", use_container_width=True):
+                with st.spinner(t("analyzing")):
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tf:
+                        tf.write(up.getvalue())
+                        t_path = tf.name
+                    try:
+                        # [FIX] 呼叫新的 generate_rubric (支援 granularity)
+                        res = generate_rubric(
+                            pdf_path=t_path, 
+                            model_name=user.model_name, 
+                            api_key=user.google_api_key, 
+                            subject=subj_key, 
+                            language=ss.get("language", "繁體中文"), 
+                            granularity=ss["rubric_granularity"]
+                        )
+                        
+                        if res:
+                            # 轉為字串
+                            if isinstance(res, (dict, list)):
+                                new_content = json.dumps(res, indent=2, ensure_ascii=False)
+                            else:
+                                new_content = str(res)
+                            
+                            # [CRITICAL FIX] 同步資料變數與 Widget 狀態
+                            ss[EDITOR_KEY] = new_content
+                            ss[WIDGET_KEY] = new_content 
+                            
+                            st.toast(t("msg_rubric_generated"), icon="✅")
+                            st.rerun()
+                        else:
+                            st.error(t("msg_gen_failed"))
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+                    finally:
+                        if os.path.exists(t_path): os.unlink(t_path)
+        else:
+            st.info(t("msg_please_upload_first"))
+
+    # --- 4. 編輯框區 (恆常顯示) ---
+    st.markdown("---")
+    st.subheader("📝 " + t("hdr_edit_rubric", "編輯 / 確認評分標準"))
+    
+    # [FIX] 解決 "created with default value" 警告
+    # 邏輯：如果 Widget 還沒初始化，先給它 EDITOR_KEY 的值
+    if WIDGET_KEY not in ss:
+        ss[WIDGET_KEY] = ss[EDITOR_KEY]
+
+    # [FIX] 移除 value=... 參數，完全依賴 key (WIDGET_KEY) 來控制
+    updated_txt = st.text_area(
+        t("rubric_area_label"), 
+        height=500, 
+        key=WIDGET_KEY
+    )
+    
+    # 反向同步：使用者打字時，更新回 EDITOR_KEY
+    ss[EDITOR_KEY] = updated_txt
+
+    # --- 5. 按鈕區 ---
+    c1, c2 = st.columns(2)
+    with c1:
+        st.button("🔄 " + t("btn_clear", "清空"), on_click=_clear_cb)
+            
+    with c2:
+        if st.button(t("save_next") + " ➡️", type="primary"):
+            parsed = _safe_json_loads(updated_txt)
+            if parsed:
+                ss["rubric_json"] = parsed
+                ss["rubric_content"] = updated_txt
+                ss["current_step"] = 2
+                st.rerun()
+            else:
+                st.error("❌ JSON Format Error")
+
+
+####
+
+
+
+
+def oldrender_step_1_rubric(user):
+    st.header(t("step_1"))
+    ss = st.session_state
+    
+    # --- 1. 狀態初始化 ---
+    EDITOR_KEY = "rubric_editor_fixed"      # 存放資料的 Key
+    WIDGET_KEY = "main_rubric_text_area"    # 綁定 UI 的 Key
+    
+    if EDITOR_KEY not in ss: ss[EDITOR_KEY] = ""
+    if "rubric_granularity" not in ss: ss["rubric_granularity"] = "標準"
+
+    # [清空回呼] 解決按鈕無效問題
+    def _clear_cb():
+        ss[EDITOR_KEY] = ""
+        ss[WIDGET_KEY] = ""
+
+    # --- 2. 參數選擇區 ---
+    subj_key = render_subject_selector("rubric_gen")
+    st.markdown("---")
+
+    st.subheader("🎯 " + t("hdr_grading_config", "評分設定"))
+    gran_options = ["精簡", "標準", "診斷"]
+    selected_gran = st.select_slider(
+        t("lbl_rubric_granularity", "評分細緻度"),
+        options=gran_options,
+        value=ss.get("rubric_granularity", "標準")
+    )
+    ss["rubric_granularity"] = selected_gran
+    st.markdown(" ")
+
+    # --- 3. 上傳與生成區 ---
+    col_up, col_ai = st.columns([1, 1])
+    with col_up:
+        up = st.file_uploader(t("upload_rubric_label"), type=["pdf"], key="rub_up")
+    
+    with col_ai:
+        if up:
+            if st.button(t("ai_gen_rubric"), type="primary", use_container_width=True):
+                with st.spinner(t("analyzing")):
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tf:
+                        tf.write(up.getvalue())
+                        t_path = tf.name
+                    try:
+                        # [FIX] 呼叫新的 generate_rubric (支援 granularity)
+                        res = generate_rubric(
+                            pdf_path=t_path,
+                            model_name=user.model_name,
+                            api_key=user.google_api_key,
+                            subject=subj_key,
+                            language=ss.get("language", "繁體中文"),
+                            granularity=ss["rubric_granularity"]
+                        )
+                        
+                        if res:
+                            # 轉為字串
+                            if isinstance(res, (dict, list)):
+                                new_content = json.dumps(res, indent=2, ensure_ascii=False)
+                            else:
+                                new_content = str(res)
+                            
+                            # [CRITICAL FIX] 同步資料變數與 Widget 狀態
+                            ss[EDITOR_KEY] = new_content
+                            ss[WIDGET_KEY] = new_content
+                            
+                            st.toast(t("msg_rubric_generated"), icon="✅")
+                            st.rerun()
+                        else:
+                            st.error(t("msg_gen_failed"))
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+                    finally:
+                        if os.path.exists(t_path): os.unlink(t_path)
+        else:
+            st.info(t("msg_please_upload_first"))
+
+    # --- 4. 編輯框區 (恆常顯示) ---
+    st.markdown("---")
+    st.subheader("📝 " + t("hdr_edit_rubric", "編輯 / 確認評分標準"))
+    
+    # [FIX] 解決 "created with default value" 警告
+    # 邏輯：如果 Widget 還沒初始化，先給它 EDITOR_KEY 的值
+    if WIDGET_KEY not in ss:
+        ss[WIDGET_KEY] = ss[EDITOR_KEY]
+
+    # [FIX] 移除 value=... 參數，完全依賴 key (WIDGET_KEY) 來控制
+    updated_txt = st.text_area(
+        t("rubric_area_label"),
+        height=500,
+        key=WIDGET_KEY
+    )
+    
+    # 反向同步：使用者打字時，更新回 EDITOR_KEY
+    ss[EDITOR_KEY] = updated_txt
+
+    # --- 5. 按鈕區 ---
+    c1, c2 = st.columns(2)
+    with c1:
+        st.button("🔄 " + t("btn_clear", "清空"), on_click=_clear_cb)
+            
+    with c2:
+        if st.button(t("save_next") + " ➡️", type="primary"):
+            parsed = _safe_json_loads(updated_txt)
+            if parsed:
+                ss["rubric_json"] = parsed
+                ss["rubric_content"] = updated_txt
+                ss["current_step"] = 2
+                st.rerun()
+            else:
+                st.error("❌ JSON Format Error")
+
+
+
+#####
+
+#==============================================================================
+#  STEP 2 (Grading)
+# ==============================================================================
+
+def render_step_2_grading(user):
+    st.header(t("step_2"))
+    ss = st.session_state
+    rub_json = ss.get("rubric_json", {})
+    
+    if st.button("⬅️ " + t("prepare_rubric"), type="secondary"):
+        ss["current_step"] = 1
+        st.rerun()
+
+    col_conf, col_file = st.columns([1, 2])
+    with col_conf:
+        st.subheader("⚙️ " + t("grading_settings"))
+        
+        # [FIXED] Using new subject selector
+        internal_subject = render_subject_selector(key_prefix="grading_exec")
+        st.caption(f"🔧 System Key: `{internal_subject}`")
+        
+        # [MODIFIED] Logic Preservation with Localization
+        strat_opts = ["Vertical (Full Page)", "Collage (Fast Grid)"]
+        strat_map = {"Vertical (Full Page)": t("strat_vertical", "Vertical"), "Collage (Fast Grid)": t("strat_collage", "Collage")}
+        
+        strategy_raw = st.radio(
+            t("grading_strategy"),
+            strat_opts,
+            index=1,
+            format_func=lambda x: strat_map.get(x, x)
+        )
+
+        mode = st.select_slider(t("mode_label"), ["Standard", "Strict"])
+        report_mode = st.radio(t("report_mode"), options=["simple", "full"], index=0)
+        ss["report_mode"] = report_mode
+        temp_val = st.slider(t("lbl_temperature", "Temperature"), 0.0, 1.0, 0.0, 0.05)
+        st.markdown("---")
+        with st.expander(f"📐 {t('lbl_vision_settings', 'Vision')}", expanded=True):
+            man_ratio = st.slider(t("lbl_header_ratio", "Header Ratio"), 0.10, 0.70, 0.25, 0.01)
+            ignore_first = st.checkbox(t("lbl_ignore_first", "Ignore 1st Box"), help=t("help_ignore_first", "Skip box 1"))
+
+    with col_file:
+        up_pdf = st.file_uploader(t("upload_exam_label"), type=["pdf"], key="exam_up")
+        if up_pdf:
+            pps = st.number_input(t("pps_label"), 1, 10, 2)
+            if st.button(f"✂️ {t('split_btn')}", type="primary"):
+                with st.spinner(t("splitting")):
+                    ss["exam_chunks"] = split_pdf_by_pages(up_pdf, pps); st.rerun()
+            
+            if ss.get("exam_chunks"):
+                chunks = ss["exam_chunks"]
+                st.info(f"📚 {len(chunks)} {t('msg_students_loaded', 'Students')}")
+                
+                # Check raw value for logic
+                if "Collage" in strategy_raw:
+                    st.markdown(f"#### 🖼️ {t('hdr_layout_analysis', 'Layout Analysis')}")
+                    c_btn_1, c_btn_2 = st.columns([1, 1])
+                    trigger_analysis = False
+                    with c_btn_1:
+                        if st.button(f"🔍 {t('btn_detect_layout', 'Detect Layout')}", type="secondary"): trigger_analysis = True
+                    with c_btn_2:
+                         if st.button(f"❌ {t('btn_reset_layout', 'Reset')}"): ss.pop("layout_map", None); st.rerun()
+
+                    if trigger_analysis:
+                        with st.spinner(t("msg_analyzing_layout", "Analyzing...")):
+                            imgs = pdf_to_images(chunks[0])
+                            rubric_json = ss.get("rubric_json", {})
+                            all_labels = _map_rubric_to_labels(rubric_json)
+                            if not all_labels: st.warning(f"⚠️ {t('warn_no_rubric_detected', 'No Rubric')}")
+                            
+                            label_cursor = 0
+                            full_layout_list = []
+                            for page_idx, page_img in enumerate(imgs):
+                                cv_img = cv2.cvtColor(np.array(page_img), cv2.COLOR_RGB2BGR)
+                                aligned = VisionService.align_document(cv_img)
+                                is_p1 = (page_idx == 0)
+                                boxes, cutoff = VisionService.detect_answer_areas(aligned, is_first_page=is_p1, manual_p1_ratio=man_ratio)
+                                if ignore_first and is_p1 and boxes: boxes.pop(0)
+
+                                current_page_labels = []
+                                if all_labels:
+                                    count = len(boxes)
+                                    current_page_labels = all_labels[label_cursor : label_cursor + count]
+                                    label_cursor += count
+                                
+                                debug_img = VisionService.draw_debug_boxes(aligned, boxes, labels=current_page_labels, actual_cutoff=cutoff)
+                                full_layout_list.append({"page": page_idx, "boxes": boxes, "vis_img": debug_img})
+                            ss["layout_map"] = full_layout_list
+
+                    if ss.get("layout_map"):
+                        st.success(f"✅ {t('msg_layout_analyzed', 'Done')}: {len(ss['layout_map'])} Pages")
+                        for p_data in ss["layout_map"]:
+                            st.image(cv2.cvtColor(p_data['vis_img'], cv2.COLOR_BGR2RGB), caption=f"Page {p_data['page']+1}", width='stretch')
+
+                with st.expander(f"👀 {t('preview_chunks')}", expanded=True):
+                    num_chunks = len(chunks)
+                    idx = st.slider("Student", 0, num_chunks - 1, 0) if num_chunks > 1 else 0
+                    st.markdown("### 📄 PDF Preview")
+                    if idx < len(chunks): display_pdf(chunks[idx], height=600)
+                
+                if st.button(t("start_grading_btn"), type="primary"):
+                    user_plan = user.plan
+                    current_weekly_usage = get_user_weekly_page_count(user.id)
+                    custom_page = int(getattr(user, 'custom_page_limit', 0) or 0)
+                    if custom_page > 0: max_limit = custom_page
+                    else:
+                        plan_key = f"QUOTA_{user.plan.upper()}_WEEKLY_PAGES"
+                        fallback = {"free": 70, "pro": 500, "premium": 1000, "enterprise": 5000}.get(user.plan, 70)
+                        max_limit = int(get_sys_conf(plan_key) or fallback)
+
+                    incoming_pages = len(chunks) * pps
+                    if (current_weekly_usage + incoming_pages) > max_limit:
+                        st.error(f"❌ {t('quota_exceeded_msg')}")
+                    else:
+                        rubric_content = ss.get("rubric_content", "")
+                        if "Collage" in strategy_raw:
+                            _run_collage_batch(user, chunks, rubric_content, rub_json, man_ratio, temp_val, mode, internal_subject, ignore_first=ignore_first)
+                        else:
+                            _run_vertical_batch(user, chunks, mode, man_ratio, temp_val, internal_subject, rub_json)
+
+def _update_status(status_container, start_time, done, total, current_task):
+    elapsed = time.time() - start_time
+    rate = done / elapsed if elapsed > 0 and done > 0 else 0.0
+    remaining = total - done
+    eta_str = f"{(remaining / rate):.1f}s" if rate > 0 else t("calc_eta", "Calculating...")
+    prog = min(1.0, done / total) if total > 0 else 0
+    html = f"""
+    <div style="border:1px solid #ddd; padding:12px; border-radius:10px; background-color:#f9f9f9; margin-bottom:15px; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <span style="color:#2c3e50; font-weight:600; font-size:15px;">🔄 {current_task}</span>
+            <span style="color:#e67e22; font-weight:bold; font-size:16px;">{int(prog*100)}%</span>
+        </div>
+        <div style="width:100%; background-color:#e0e0e0; height:100%; border-radius:5px; overflow:hidden;">
+            <div style="width:{prog*100}%; background-color:#4B7BEC; height:100%; border-radius:5px; transition: width 0.5s ease;"></div>
+        </div>
+        <div style="display:flex; justify-content:space-between; font-size:13px; margin-top:8px; color:#555;">
+            <span>⏱️ Elapsed: <b>{elapsed:.1f}s</b></span>
+            <span>🚀 Speed: <b>{rate:.2f} it/s</b></span>
+            <span>🏁 ETA: <b>{eta_str}</b></span>
+        </div>
+    </div>
+    """
+    status_container.markdown(html, unsafe_allow_html=True)
+
+######Fixed###
+
+class AtomicBatchProcessor:
+    def __init__(self, batch_size=9, grid_cols=3):
+        self.batch_size = batch_size
+        self.grid_cols = grid_cols
+
+    def _is_blank(self, img, threshold=1.5):
+        """[RESTORED] 寬鬆閾值，防止 NO DATA"""
+        if img is None or img.size == 0:
+            return True
+        return cv2.Laplacian(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var() < threshold
+
+    def create_batches(self, items, unit_size=(1024, 600)):
+        """將題目清單切分成多個 3x3 網格批次"""
+        batches_result = []
+        for i in range(0, len(items), self.batch_size):
+            chunk = items[i : i + self.batch_size]
+            batches_result.append(self._create_single_batch(chunk, unit_size))
+        return batches_result
+
+    def _create_single_batch(self, chunk, unit_size):
+        """
+        [RESTORED] 建立單一網格影像，並回傳完整的追蹤 ID
+        """
+        uw, uh = unit_size
+        rows = self.batch_size // self.grid_cols
+        
+        # 1. 產生該網格唯一的 Batch UUID (用於檔案命名與 Traceability)
+        batch_uuid = str(uuid.uuid4())[:8]
+        
+        # 2. 建立畫布與 Manifest 結構
+        canvas = np.full((rows * uh, self.grid_cols * uw, 3), 255, dtype=np.uint8)
+        manifest = {
+            "batch_id": batch_uuid, # 在 manifest 內也保留一份備份
+            "cells": []
+        }
+        
+        for idx in range(self.batch_size):
+            r, c = divmod(idx, self.grid_cols)
+            ys, xs = r * uh, c * uw
+            
+            cell_info = {"index": idx, "is_empty": True, "sid": None}
+            
+            if idx < len(chunk):
+                item = chunk[idx]
+                img = item['img']
+                
+                if self._is_blank(img):
+                    # 即使是空白也必須佔位，否則會導致學生 B 跳到學生 A 的位置
+                    cv2.putText(canvas, f"ID:{idx} EMPTY", (xs + 50, ys + uh // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (180, 180, 180), 2)
+                else:
+                    # 貼上影像並畫上紅色識別標籤
+                    resized = cv2.resize(img, (uw, uh), interpolation=cv2.INTER_LANCZOS4)
+                    canvas[ys:ys+uh, xs:xs+uw] = resized
+                    cv2.rectangle(canvas, (xs, ys), (xs + uw, ys + uh), (200, 200, 200), 2)
+                    cv2.putText(canvas, f"ID:{idx}", (xs + 20, ys + 80),
+                                cv2.FONT_HERSHEY_SIMPLEX, 3.0, (0, 0, 255), 6)
+                    
+                    cell_info["is_empty"] = False
+                    cell_info["sid"] = item['sid']
+            
+            manifest["cells"].append(cell_info)
+            
+        # [RESTORED] 回傳頂層 batch_id，確保 _run_collage_batch 能夠正確存檔與映射
+        return {
+            "image": canvas,
+            "manifest": manifest,
+            "batch_id": batch_uuid
+        }
+
+#####
+
+def _run_vertical_batch(user, chunks, mode, ratio, temp, subject, rubric_json):
+    ss = st.session_state
+    status_box = st.empty()
+    bid = _generate_meaningful_batch_id(user)
+    ss["current_batch_id"] = bid
+    workers = _get_max_workers(user)
+    start_t = time.time()
+    total = len(chunks)
+    results = []
+    
+    allowed_labels = _map_rubric_to_labels(rubric_json)
+    current_lang = ss.get("language", "繁體中文")
+
+    _update_status(status_box, start_t, 0, total, f"{t('status_init_ai', 'Init AI')} ({subject} Mode)...")
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(
+            _process_single_student_vert,
+            user, i, ck, ss.get("rubric_content", ""), bid, mode, ratio, temp, allowed_labels, current_lang, subject, rubric_json
+        ): i for i, ck in enumerate(chunks)}
+        
+        for i, f in enumerate(as_completed(futures)):
+            try:
+                res = f.result()
+                results.append(res)
+                _update_status(status_box, start_t, i + 1, total, f"{t('status_grading_student', 'Grading')} {i+1}/{total}")
+            except Exception as e:
+                print(f"Error: {e}")
+
+    if results:
+        save_batch_results(user.id, bid, results)
+        ss["grading_results"] = results
+        ss["current_step"] = 3
+        st.rerun()
+    else:
+        st.error(t("err_grading_failed"))
+
+def _process_single_student_vert(user, idx, ck, rubric, bid, mode, ratio, temp, allowed_labels, lang, subject, rubric_json):
+    imgs = pdf_to_images(ck)
+    rid, rname, cost_ocr = _identify_student_info(user, imgs[0], ratio)
+    
+    res = GradingService.grade_submission(
+        images=imgs, rubric_text=rubric, user=user, batch_id=bid, student_idx=idx+1,
+        mode=mode, subject=subject, ai_memory="", temperature=temp,
+        allowed_labels=allowed_labels, language=lang
+    )
+    
+    recalc_total = 0.0
+    if "questions" in res and rubric_json:
+        for q in res["questions"]:
+            q_id = q.get("id")
+            score = float(q.get("score", 0))
+            max_val = _find_max_score_in_rubric_json(rubric_json, q_id)
+            if max_val is not None:
+                q["max_score"] = max_val
+                if score > max_val:
+                    q["original_ai_score"] = score
+                    q["score"] = max_val
+                    score = max_val
+                    q["reasoning"] += f"\n[System Correction] Score capped at {max_val}."
+            recalc_total += score
+        res["total_score"] = recalc_total
+
+    score = _safe_float(res.get("total_score") if res.get("total_score") is not None else res.get("score"), 0.0)
+    cost_grading = _safe_float(res.get("cost_usd"), 0.0)
+    total_cost = cost_ocr + cost_grading
+    sid = rid if rid else f"S{idx+1:03d}"
+    file_path = _save_student_pdf(bid, sid, ck)
+    res["rubric"] = rubric_json
+    res.update({
+        "Student ID": sid, "Name": rname or "Unknown",
+        "total_score": score, "cost_usd": total_cost,
+        "cost_breakdown": {"flash_ocr": cost_ocr, "pro_grading": cost_grading},
+        "file_path": file_path, "page_count": len(imgs)
+    })
+    return res
+##### FIXED######
+def _run_collage_batch(user, chunks, rubric_text, rubric_json, ratio, temp, mode, subject, ignore_first=False):
+    """
+    
+    針對結構化考卷優化的網格閱卷邏輯。
+    解決：1. 小題編號錯位 2. 第二位學生辨識失敗 3. 歷史紀錄細目缺失。
+    """
+    ss = st.session_state
+    status = st.empty()
+    start_t = time.time()
+    bid = _generate_meaningful_batch_id(user)
+    ss["current_batch_id"] = bid
+    student_map = []
+    
+    # --- Phase 1: 影像預處理與身份辨識 (0% ~ 33%) ---
+    _update_status(status, start_t, 0, len(chunks) * 3, t("status_phase_1"))
+    
+    for i, ck in enumerate(chunks):
+        imgs = pdf_to_images(ck)
+        # 執行身份 OCR
+        sid, name, cost = _identify_student_info(user, imgs[0], ratio)
+        dsid = sid or f"S{i+1:03d}"
+        
+        student_map.append({
+            "sid": dsid,
+            "name": name,
+            "cv_imgs": [cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR) for im in imgs],
+            "cost_ocr": cost,
+            "file_path": _save_student_pdf(bid, dsid, ck)
+        })
+        _update_status(status, start_t, i + 1, len(chunks) * 3, f"Scanning {dsid}")
+
+    # --- Phase 2: 物理佈局映射 (33% ~ 50%) ---
+    q_labels = _map_rubric_to_labels(rubric_json)
+    
+    # [FIX] 穩定排序：解決 Q1(a) 與 Q1(b) 在同頁不同位置的辨識順序
+    def stable_sort(boxes):
+        # y // 60 將 60px 內的垂直偏差視為同一行，避免 ID 標籤跳號
+        return sorted(boxes, key=lambda b: (b[1] // 60, b[0]))
+    
+    template = []
+    s_ref = student_map[0] # 使用第一位學生作為座標基準
+    ptr = 0
+    
+    for p_idx, img in enumerate(s_ref["cv_imgs"]):
+        aligned = VisionService.align_document(img)
+        # 偵測考卷上的所有作答框
+        boxes, _ = VisionService.detect_answer_areas(
+            aligned,
+            is_first_page=(p_idx == 0),
+            manual_p1_ratio=ratio
+        )
+        
+        if ignore_first and p_idx == 0 and boxes:
+            boxes.pop(0)
+            
+        # 套用穩定排序，將題號標籤與物理區域 1:1 綁定
+        for b in stable_sort(boxes):
+            if ptr < len(q_labels):
+                lbl = q_labels[ptr]
+                template.append({"page": p_idx, "box": b, "label": lbl})
+                ptr += 1
+
+    # 切割題目影像並分類
+    q_batches = {l: [] for l in q_labels}
+    for stu in student_map:
+        for m in template:
+            if m["page"] < len(stu["cv_imgs"]):
+                crops = VisionService.crop_images_by_layout(
+                    VisionService.align_document(stu["cv_imgs"][m["page"]]),
+                    [m["box"]]
+                )
+                if crops:
+                    q_batches[m["label"]].append({"sid": stu["sid"], "img": crops[0]})
+
+    # --- Phase 3: AI 批改與結果封裝 (50% ~ 100%) ---
+    final_grades = {
+        s["sid"]: {
+            "Student ID": s["sid"], "Name": s["name"] or "Unknown",
+            "questions": [], "total_score": 0, "cost_usd": s["cost_ocr"],
+            "file_path": s["file_path"], "rubric": rubric_json
+        } for s in student_map
+    }
+    
+    proc = AtomicBatchProcessor()
+    futures = []
+    
+    with ThreadPoolExecutor(max_workers=_get_max_workers(user)) as ex:
+        for q_id, items in q_batches.items():
+            for ab in proc.create_batches(items):
+                v_ids = [c['index'] for c in ab['manifest']['cells'] if not c['is_empty']]
+                f = ex.submit(
+                    GradingService.grade_collage_submission,
+                    Image.fromarray(cv2.cvtColor(ab['image'], cv2.COLOR_BGR2RGB)),
+                    q_id, ss.get("rubric_content", ""), user, mode, subject, temp,
+                    "gemini-2.5-pro", q_labels, v_ids, ss.get("language", "繁體中文")
+                )
+                futures.append((f, q_id, ab['manifest']))
+        
+        done_grids = 0
+        total_grids = len(futures)
+        
+        for f, q_id, mani in futures:
+            try:
+                res_data = f.result(timeout=150)
+                ai_res = res_data.get("results", [])
+                max_v = _find_max_score_in_rubric_json(rubric_json, q_id)
+                
+                for cell in mani['cells']:
+                    if cell['is_empty']: continue
+                    
+                    # 依據視覺 Index 尋找 AI 回傳結果
+                    item = next((r for r in ai_res if r.get("index") == cell['index']), None)
+                    
+                    # [CRITICAL] 強制封裝 breakdown，解決「AUTO: 0 pts」與歷史紀錄問題
+                    q_data = {
+                        "id": q_id,
+                        "score": min(float(item.get("score", 0)) if item else 0.0, max_v or 99),
+                        "reasoning": item.get("reasoning", "") if item else "NO DATA (辨識失敗)",
+                        "breakdown": item.get("breakdown", []) if item else [] # 此行不可刪除
+                    }
+                    
+                    if cell['sid'] in final_grades:
+                        final_grades[cell['sid']]["questions"].append(q_data)
+                        final_grades[cell['sid']]["total_score"] += q_data["score"]
+                        final_grades[cell['sid']]["cost_usd"] += (res_data.get("cost_usd", 0) / max(1, len(v_ids)))
+            except Exception as e:
+                logging.error(f"Batch Error: {e}")
+            
+            done_grids += 1
+            current_prog = (len(chunks) * 1.5) + (done_grids / max(1, total_grids) * (len(chunks) * 1.5))
+            _update_status(status, start_t, current_prog, len(chunks) * 3, f"Grading {q_id}")
+
+    # 存檔並結束
+    res_list = list(final_grades.values())
+    save_batch_results(user.id, bid, res_list)
+    ss.update({"grading_results": res_list, "current_step": 3})
+    st.rerun()
+
+##########
+
+#####
+def render_step_3_report(user):
+    ss = st.session_state
+    res = ss.get("grading_results", [])
+    # 解決 UNK 問題：優先從 session 拿，拿不到就從結果的第一筆拿
+    bid = ss.get("current_batch_id", res[0].get("batch_id", "Manual_Batch") if res else "UNK")
+    rubric_json = ss.get("rubric_json", {})
+    
+    if not res:
+        st.warning(t("no_results_yet"))
+        return
+
+    # 1. 資料處理：忽略回傳的舊 cost，改用手動精確加總
+    df, _ = merge_and_calculate_data(res)
+    if "Final Score" not in df.columns:
+        df["Final Score"] = 0.0
+    q_stats_df = analyze_questions_performance(res, rubric_json)
+    
+    st.success(f"✅ {t('batch_complete')} (ID: {bid})")
+    
+    # 2. 顯示成績表格
+    st.dataframe(df, use_container_width=True)
+
+    # 3. 統計圖表區 (使用 try-except 保護)
+    st.subheader(f"📊 {t('statistics_overview')}")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"##### 📈 {t('chart_score_dist', 'Score Dist')}")
+        try:
+            fig = generate_score_distribution_chart(df)
+            if fig:
+                st.pyplot(fig)
+                plt.close(fig)
+        except: pass
+    with c2:
+        st.markdown(f"##### 📉 {t('chart_question_analysis', 'Analysis')}")
+        try:
+            fig = generate_question_analysis_chart(q_stats_df)
+            if fig:
+                st.pyplot(fig)
+                plt.close(fig)
+        except: pass
+
+    st.markdown("---")
+
+    # 4. [CRITICAL FIX] 成本分析加總邏輯對齊
+    # 對應 _run_collage_batch 中的存檔 Key: cost_ocr 與 cost_usd
+    total_flash = sum([float(r.get("cost_ocr", 0)) for r in res])
+    total_pro = sum([float(r.get("cost_usd", 0)) for r in res])
+    total_sum = total_flash + total_pro
+
+    st.markdown(f"#### 💰 {t('hdr_cost_analysis', 'Cost')}")
+    c1_c, c2_c, c3_c = st.columns(3)
+    # 使用小數點後四位確保 0.029 能被看見
+    c1_c.metric("⚡ Flash (OCR)", f"${total_flash:.4f}")
+    c2_c.metric("🧠 Pro (Grading)", f"${total_pro:.4f}")
+    c3_c.metric("💵 Total", f"${total_sum:.4f}")
+    
+    # 5. 成績平均與及格率
+    m1, m2, m3, m4 = st.columns(4)
+    scores = df["Final Score"]
+    pass_len = len(scores[scores >= 60])
+    m1.metric(t("average_score"), f"{scores.mean():.1f}")
+    m2.metric(t("median_score"), f"{scores.median():.1f}")
+    m3.metric(t("pass_count"), f"{pass_len}")
+    m4.metric(t("pass_rate"), f"{(pass_len/len(scores)*100 if len(scores) else 0):.1f}%")
+
+    # 6. AI 班級分析報告
+    if st.button(f"✨ {t('gen_class_analysis_btn')}", type="primary"):
+        with st.spinner(t("analyzing")):
+            ss["class_analysis"] = generate_class_analysis(
+                res, ss.get("rubric_content", ""), user.google_api_key,
+                report_mode=ss.get("report_mode", "simple"),
+                language=ss.get("language", "繁體中文")
+            )
+            st.rerun()
+            
+    # 7. 下載區域 (PDF 與 ZIP)
+    pdf_bytes = None
+    if "class_analysis" in ss:
+        st.markdown("---")
+        st.markdown(ss["class_analysis"])
+        pdf_cache_key = f"pdf_cache_{bid}"
+        if pdf_cache_key not in ss:
+            with st.spinner(t("msg_generating_pdf")):
+                try:
+                    ss[pdf_cache_key] = PdfReportWorker.generate_professional_pdf(bid, df, ss["class_analysis"], user=user, q_stats_df=q_stats_df)
+                except Exception as e: st.error(f"PDF Error: {e}")
+        pdf_bytes = ss.get(pdf_cache_key)
+        if pdf_bytes:
+            st.download_button(t("btn_download_pdf"), pdf_bytes, f"{bid}.pdf", "application/pdf")
+
+    zip_buf = create_advanced_zip_report(bid, df, ss.get("class_analysis", ""), q_stats_df=q_stats_df, pdf_bytes=pdf_bytes)
+    st.download_button(t("download_zip_btn"), zip_buf, f"{bid}.zip", "application/zip", type="primary")
+    
+    # 8. 重置 Session 按鈕
+    if st.button(f"🔄 {t('btn_new_session', 'New Session')}"):
+        keys_to_clear = [
+            "grading_results", "exam_chunks", "class_analysis",
+            "layout_map", "rubric_editor_lock_final", "rubric_json"
+        ]
+        for k in keys_to_clear: ss.pop(k, None)
+        pdf_cache_key = f"pdf_cache_{bid}"
+        if pdf_cache_key in ss: del ss[pdf_cache_key]
+        ss["current_step"] = 1
+        st.rerun()
+
+
+#####
+def render_step_3_report1(user):
+    ss = st.session_state
+    res = ss.get("grading_results", [])
+    bid = ss.get("current_batch_id", "UNK")
+    rubric_json = ss.get("rubric_json", {})
+    if not res: st.warning(t("no_results_yet")); return
+
+    df, cost = merge_and_calculate_data(res)
+    if "Final Score" not in df.columns: df["Final Score"] = 0.0
+    q_stats_df = analyze_questions_performance(res, rubric_json)
+    
+    st.success(f"✅ {t('batch_complete')}")
+    st.dataframe(df)
+
+    st.subheader(f"📊 {t('statistics_overview')}")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"##### 📈 {t('chart_score_dist', 'Score Dist')}")
+        try:
+            fig = generate_score_distribution_chart(df)
+            if fig:
+                st.pyplot(fig)
+                plt.close(fig)
+        except: pass
+    with c2:
+        st.markdown(f"##### 📉 {t('chart_question_analysis', 'Analysis')}")
+        try:
+            fig = generate_question_analysis_chart(q_stats_df)
+            if fig:
+                st.pyplot(fig)
+                plt.close(fig)
+        except: pass
+
+    st.markdown("---")
+    total_flash = sum([r.get("cost_breakdown", {}).get("flash_ocr", 0) for r in res])
+    total_pro = sum([r.get("cost_breakdown", {}).get("pro_grading", 0) for r in res])
+    total_sum = total_flash + total_pro
+    st.markdown(f"#### 💰 {t('hdr_cost_analysis', 'Cost')}")
+    c1_c, c2_c, c3_c = st.columns(3)
+    c1_c.metric("⚡ Flash (OCR)", f"${total_flash:.4f}")
+    c2_c.metric("🧠 Pro (Grading)", f"${total_pro:.4f}")
+    c3_c.metric("💵 Total", f"${total_sum:.4f}")
+    
+    m1, m2, m3, m4 = st.columns(4)
+    scores = df["Final Score"]
+    pass_len = len(scores[scores >= 60])
+    m1.metric(t("average_score"), f"{scores.mean():.1f}")
+    m2.metric(t("median_score"), f"{scores.median():.1f}")
+    m3.metric(t("pass_count"), f"{pass_len}")
+    m4.metric(t("pass_rate"), f"{(pass_len/len(scores)*100 if len(scores) else 0):.1f}%")
+
+    if st.button(f"✨ {t('gen_class_analysis_btn')}", type="primary"):
+        with st.spinner(t("analyzing")):
+            ss["class_analysis"] = generate_class_analysis(
+                res, ss.get("rubric_content", ""), user.google_api_key,
+                report_mode=ss.get("report_mode", "simple"), language=ss.get("language", "繁體中文")
+            )
+            st.rerun()
+            
+    pdf_bytes = None
+    if "class_analysis" in ss:
+        st.markdown(ss["class_analysis"])
+        pdf_cache_key = f"pdf_cache_{bid}"
+        if pdf_cache_key not in ss:
+            with st.spinner(t("msg_generating_pdf", "Generating PDF...")):
+                try:
+                    ss[pdf_cache_key] = PdfReportWorker.generate_professional_pdf(bid, df, ss["class_analysis"], user=user, q_stats_df=q_stats_df)
+                except Exception as e: st.error(f"PDF Error: {e}")
+        pdf_bytes = ss.get(pdf_cache_key)
+        if pdf_bytes: st.download_button(t("btn_download_pdf", "Download PDF"), pdf_bytes, f"{bid}.pdf", "application/pdf")
+
+    zip_buf = create_advanced_zip_report(bid, df, ss.get("class_analysis", ""), q_stats_df=q_stats_df, pdf_bytes=pdf_bytes)
+    st.download_button(t("btn_download_zip", "Download ZIP"), zip_buf, f"{bid}.zip", "application/zip", type="primary")
+    
+    if st.button(f"🔄 {t('btn_new_session', 'New Session')}"):
+        for k in ["grading_results", "exam_chunks", "class_analysis", "layout_map", "rubric_editor_lock_final", "rubric_json"]: ss.pop(k, None)
+        pdf_cache_key = f"pdf_cache_{bid}"
+        if pdf_cache_key in ss: del ss[pdf_cache_key]
+        ss["current_step"] = 1; st.rerun()
+
+def render_dashboard(user):
+    user_api_key = getattr(user, 'google_api_key', None)
+    if not user_api_key or not str(user_api_key).strip():
+        st.error("BYOK_REQUIRED: Missing API Key. Please configure your Gemini API Key in Settings.")
+        st.info(f"💡 {t('msg_no_api_key', 'No API Key')}")
+        st.warning(f"⚠️ {t('msg_system_locked', 'Locked')}")
+        st.stop()
+ 
+    st.title(t("app_title"))
+    with st.sidebar:
+        # [NEW] 1. 語言選擇器 (Language Selector)
+        st.subheader("🌐 Language")
+        lang_options = {"繁體中文": "zh_tw", "English": "en"}
+        
+        # 讀取當前設定 (反查 Key)
+        current_code = st.session_state.get("lang_code", "zh_tw")
+        current_label = "繁體中文"
+        for k, v in lang_options.items():
+            if v == current_code:
+                current_label = k
+                break
+        
+        # 顯示選單
+        selected_label = st.selectbox(
+            "Select Language",
+            options=list(lang_options.keys()),
+            index=list(lang_options.keys()).index(current_label),
+            key="language_selector_ui"
+        )
+        
+        # 更新 Session State
+        new_code = lang_options[selected_label]
+        if new_code != current_code:
+            st.session_state["lang_code"] = new_code
+            st.session_state["language"] = selected_label # 給 AI Service 用的
+            st.rerun()
+
+        st.markdown("---")
+        st.subheader(f"📊 {t('usage_header')}")
+        current_p = get_user_weekly_page_count(user.id)
+        custom_page = int(getattr(user, 'custom_page_limit', 0) or 0)
+        if custom_page > 0: limit_p = custom_page
+        else:
+            plan_key = f"QUOTA_{user.plan.upper()}_WEEKLY_PAGES"
+            fallback = {"free": 70, "pro": 500, "premium": 1000, "enterprise": 5000}.get(user.plan, 70)
+            limit_p = int(get_sys_conf(plan_key) or fallback)
+
+        p_ratio = min(current_p / limit_p, 1.0) if limit_p > 0 else 0
+        st.write(f"📖 {t('pps_label')}: {current_p} / {limit_p}")
+        st.progress(p_ratio)
+        if p_ratio >= 1.0: st.error(t('quota_exceeded_msg'))
+        st.markdown("---")
+
+    if "current_step" not in st.session_state: st.session_state["current_step"] = 1
+    step = st.session_state["current_step"]; render_step_indicator(step)
+    if step == 1: render_step_1_rubric(user)
+    elif step == 2: render_step_2_grading(user)
+    elif step == 3: render_step_3_report(user)
+
+
+#####
+
+#==============================================================================
+#  STEP 2 (Grading)
+# ==============================================================================
+
+def render_step_2_grading(user):
+    st.header(t("step_2"))
+    ss = st.session_state
+    rub_json = ss.get("rubric_json", {})
+    
+    if st.button("⬅️ " + t("prepare_rubric"), type="secondary"):
+        ss["current_step"] = 1
+        st.rerun()
+
+    col_conf, col_file = st.columns([1, 2])
+    with col_conf:
+        st.subheader("⚙️ " + t("grading_settings"))
+        
+        # [FIXED] Using new subject selector
+        internal_subject = render_subject_selector(key_prefix="grading_exec")
+        st.caption(f"🔧 System Key: `{internal_subject}`") 
+        
+        # [MODIFIED] Logic Preservation with Localization
+        strat_opts = ["Vertical (Full Page)", "Collage (Fast Grid)"]
+        strat_map = {"Vertical (Full Page)": t("strat_vertical", "Vertical"), "Collage (Fast Grid)": t("strat_collage", "Collage")}
+        
+        strategy_raw = st.radio(
+            t("grading_strategy"), 
+            strat_opts, 
+            index=1,
+            format_func=lambda x: strat_map.get(x, x)
+        )
+
+        mode = st.select_slider(t("mode_label"), ["Standard", "Strict"])
+        report_mode = st.radio(t("report_mode"), options=["simple", "full"], index=0)
+        ss["report_mode"] = report_mode
+        temp_val = st.slider(t("lbl_temperature", "Temperature"), 0.0, 1.0, 0.0, 0.05)
+        st.markdown("---")
+        with st.expander(f"📐 {t('lbl_vision_settings', 'Vision')}", expanded=True):
+            man_ratio = st.slider(t("lbl_header_ratio", "Header Ratio"), 0.10, 0.70, 0.25, 0.01)
+            ignore_first = st.checkbox(t("lbl_ignore_first", "Ignore 1st Box"), help=t("help_ignore_first", "Skip box 1"))
+
+    with col_file:
+        up_pdf = st.file_uploader(t("upload_exam_label"), type=["pdf"], key="exam_up")
+        if up_pdf:
+            pps = st.number_input(t("pps_label"), 1, 10, 2)
+            if st.button(f"✂️ {t('split_btn')}", type="primary"):
+                with st.spinner(t("splitting")):
+                    ss["exam_chunks"] = split_pdf_by_pages(up_pdf, pps); st.rerun()
+            
+            if ss.get("exam_chunks"):
+                chunks = ss["exam_chunks"]
+                st.info(f"📚 {len(chunks)} {t('msg_students_loaded', 'Students')}")
+                
+                # Check raw value for logic
+                if "Collage" in strategy_raw:
+                    st.markdown(f"#### 🖼️ {t('hdr_layout_analysis', 'Layout Analysis')}")
+                    c_btn_1, c_btn_2 = st.columns([1, 1])
+                    trigger_analysis = False
+                    with c_btn_1:
+                        if st.button(f"🔍 {t('btn_detect_layout', 'Detect Layout')}", type="secondary"): trigger_analysis = True
+                    with c_btn_2:
+                         if st.button(f"❌ {t('btn_reset_layout', 'Reset')}"): ss.pop("layout_map", None); st.rerun()
+
+                    if trigger_analysis:
+                        with st.spinner(t("msg_analyzing_layout", "Analyzing...")):
+                            imgs = pdf_to_images(chunks[0])
+                            rubric_json = ss.get("rubric_json", {})
+                            all_labels = _map_rubric_to_labels(rubric_json)
+                            if not all_labels: st.warning(f"⚠️ {t('warn_no_rubric_detected', 'No Rubric')}")
+                            
+                            label_cursor = 0 
+                            full_layout_list = []
+                            for page_idx, page_img in enumerate(imgs):
+                                cv_img = cv2.cvtColor(np.array(page_img), cv2.COLOR_RGB2BGR)
+                                aligned = VisionService.align_document(cv_img)
+                                is_p1 = (page_idx == 0)
+                                boxes, cutoff = VisionService.detect_answer_areas(aligned, is_first_page=is_p1, manual_p1_ratio=man_ratio)
+                                if ignore_first and is_p1 and boxes: boxes.pop(0)
+
+                                current_page_labels = []
+                                if all_labels:
+                                    count = len(boxes)
+                                    current_page_labels = all_labels[label_cursor : label_cursor + count]
+                                    label_cursor += count
+                                
+                                debug_img = VisionService.draw_debug_boxes(aligned, boxes, labels=current_page_labels, actual_cutoff=cutoff)
+                                full_layout_list.append({"page": page_idx, "boxes": boxes, "vis_img": debug_img})
+                            ss["layout_map"] = full_layout_list
+
+                    if ss.get("layout_map"):
+                        st.success(f"✅ {t('msg_layout_analyzed', 'Done')}: {len(ss['layout_map'])} Pages")
+                        for p_data in ss["layout_map"]:
+                            st.image(cv2.cvtColor(p_data['vis_img'], cv2.COLOR_BGR2RGB), caption=f"Page {p_data['page']+1}", width='stretch')
+
+                with st.expander(f"👀 {t('preview_chunks')}", expanded=True):
+                    num_chunks = len(chunks)
+                    idx = st.slider("Student", 0, num_chunks - 1, 0) if num_chunks > 1 else 0
+                    st.markdown("### 📄 PDF Preview")
+                    if idx < len(chunks): display_pdf(chunks[idx], height=600) 
+                
+                if st.button(t("start_grading_btn"), type="primary"):
+                    user_plan = user.plan
+                    current_weekly_usage = get_user_weekly_page_count(user.id)
+                    custom_page = int(getattr(user, 'custom_page_limit', 0) or 0)
+                    if custom_page > 0: max_limit = custom_page
+                    else:
+                        plan_key = f"QUOTA_{user.plan.upper()}_WEEKLY_PAGES"
+                        fallback = {"free": 70, "pro": 500, "premium": 1000, "enterprise": 5000}.get(user.plan, 70)
+                        max_limit = int(get_sys_conf(plan_key) or fallback)
+
+                    incoming_pages = len(chunks) * pps
+                    if (current_weekly_usage + incoming_pages) > max_limit:
+                        st.error(f"❌ {t('quota_exceeded_msg')}")
+                    else: 
+                        rubric_content = ss.get("rubric_content", "")
+                        if "Collage" in strategy_raw:
+                            _run_collage_batch(user, chunks, rubric_content, rub_json, man_ratio, temp_val, mode, internal_subject, ignore_first=ignore_first)
+                        else:
+                            _run_vertical_batch(user, chunks, mode, man_ratio, temp_val, internal_subject, rub_json)
+
+def _update_status(status_container, start_time, done, total, current_task):
+    elapsed = time.time() - start_time
+    rate = done / elapsed if elapsed > 0 and done > 0 else 0.0
+    remaining = total - done
+    eta_str = f"{(remaining / rate):.1f}s" if rate > 0 else t("calc_eta", "Calculating...")
+    prog = min(1.0, done / total) if total > 0 else 0
+    html = f"""
+    <div style="border:1px solid #ddd; padding:12px; border-radius:10px; background-color:#f9f9f9; margin-bottom:15px; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <span style="color:#2c3e50; font-weight:600; font-size:15px;">🔄 {current_task}</span>
+            <span style="color:#e67e22; font-weight:bold; font-size:16px;">{int(prog*100)}%</span>
+        </div>
+        <div style="width:100%; background-color:#e0e0e0; height:100%; border-radius:5px; overflow:hidden;">
+            <div style="width:{prog*100}%; background-color:#4B7BEC; height:100%; border-radius:5px; transition: width 0.5s ease;"></div>
+        </div>
+        <div style="display:flex; justify-content:space-between; font-size:13px; margin-top:8px; color:#555;">
+            <span>⏱️ Elapsed: <b>{elapsed:.1f}s</b></span>
+            <span>🚀 Speed: <b>{rate:.2f} it/s</b></span>
+            <span>🏁 ETA: <b>{eta_str}</b></span>
+        </div>
+    </div>
+    """
+    status_container.markdown(html, unsafe_allow_html=True)
+
+######Fixed###
+
+class AtomicBatchProcessor:
+    def __init__(self, batch_size=9, grid_cols=3):
+        self.batch_size = batch_size
+        self.grid_cols = grid_cols
+
+    def _is_blank(self, img, threshold=1.5):
+        """[RESTORED] 寬鬆閾值，防止 NO DATA"""
+        if img is None or img.size == 0: 
+            return True
+        return cv2.Laplacian(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var() < threshold
+
+    def create_batches(self, items, unit_size=(1024, 600)):
+        """將題目清單切分成多個 3x3 網格批次"""
+        batches_result = []
+        for i in range(0, len(items), self.batch_size):
+            chunk = items[i : i + self.batch_size]
+            batches_result.append(self._create_single_batch(chunk, unit_size))
+        return batches_result
+
+    def _create_single_batch(self, chunk, unit_size):
+        """
+        [RESTORED] 建立單一網格影像，並回傳完整的追蹤 ID
+        """
+        uw, uh = unit_size
+        rows = self.batch_size // self.grid_cols
+        
+        # 1. 產生該網格唯一的 Batch UUID (用於檔案命名與 Traceability)
+        batch_uuid = str(uuid.uuid4())[:8]
+        
+        # 2. 建立畫布與 Manifest 結構
+        canvas = np.full((rows * uh, self.grid_cols * uw, 3), 255, dtype=np.uint8)
+        manifest = {
+            "batch_id": batch_uuid, # 在 manifest 內也保留一份備份
+            "cells": []
+        }
+        
+        for idx in range(self.batch_size):
+            r, c = divmod(idx, self.grid_cols)
+            ys, xs = r * uh, c * uw
+            
+            cell_info = {"index": idx, "is_empty": True, "sid": None}
+            
+            if idx < len(chunk):
+                item = chunk[idx]
+                img = item['img']
+                
+                if self._is_blank(img):
+                    # 即使是空白也必須佔位，否則會導致學生 B 跳到學生 A 的位置
+                    cv2.putText(canvas, f"ID:{idx} EMPTY", (xs + 50, ys + uh // 2), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (180, 180, 180), 2)
+                else:
+                    # 貼上影像並畫上紅色識別標籤
+                    resized = cv2.resize(img, (uw, uh), interpolation=cv2.INTER_LANCZOS4)
+                    canvas[ys:ys+uh, xs:xs+uw] = resized
+                    cv2.rectangle(canvas, (xs, ys), (xs + uw, ys + uh), (200, 200, 200), 2)
+                    cv2.putText(canvas, f"ID:{idx}", (xs + 20, ys + 80), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 3.0, (0, 0, 255), 6)
+                    
+                    cell_info["is_empty"] = False
+                    cell_info["sid"] = item['sid']
+            
+            manifest["cells"].append(cell_info)
+            
+        # [RESTORED] 回傳頂層 batch_id，確保 _run_collage_batch 能夠正確存檔與映射
+        return {
+            "image": canvas, 
+            "manifest": manifest, 
+            "batch_id": batch_uuid
+        }
+
+#####
+
+def _run_vertical_batch(user, chunks, mode, ratio, temp, subject, rubric_json):
+    ss = st.session_state
+    status_box = st.empty()
+    bid = _generate_meaningful_batch_id(user)
+    ss["current_batch_id"] = bid
+    workers = _get_max_workers(user) 
+    start_t = time.time()
+    total = len(chunks)
+    results = []
+    
+    allowed_labels = _map_rubric_to_labels(rubric_json)
+    current_lang = ss.get("language", "繁體中文")
+
+    _update_status(status_box, start_t, 0, total, f"{t('status_init_ai', 'Init AI')} ({subject} Mode)...")
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(
+            _process_single_student_vert, 
+            user, i, ck, ss.get("rubric_content", ""), bid, mode, ratio, temp, allowed_labels, current_lang, subject, rubric_json
+        ): i for i, ck in enumerate(chunks)}
+        
+        for i, f in enumerate(as_completed(futures)):
+            try:
+                res = f.result()
+                results.append(res)
+                _update_status(status_box, start_t, i + 1, total, f"{t('status_grading_student', 'Grading')} {i+1}/{total}")
+            except Exception as e:
+                print(f"Error: {e}")
+
+    if results:
+        save_batch_results(user.id, bid, results)
+        ss["grading_results"] = results
+        ss["current_step"] = 3
+        st.rerun()
+    else:
+        st.error(t("err_grading_failed"))
+
+def _process_single_student_vert(user, idx, ck, rubric, bid, mode, ratio, temp, allowed_labels, lang, subject, rubric_json):
+    imgs = pdf_to_images(ck)
+    rid, rname, cost_ocr = _identify_student_info(user, imgs[0], ratio)
+    
+    res = GradingService.grade_submission(
+        images=imgs, rubric_text=rubric, user=user, batch_id=bid, student_idx=idx+1, 
+        mode=mode, subject=subject, ai_memory="", temperature=temp, 
+        allowed_labels=allowed_labels, language=lang
+    )
+    
+    recalc_total = 0.0
+    if "questions" in res and rubric_json:
+        for q in res["questions"]:
+            q_id = q.get("id")
+            score = float(q.get("score", 0))
+            max_val = _find_max_score_in_rubric_json(rubric_json, q_id)
+            if max_val is not None:
+                q["max_score"] = max_val 
+                if score > max_val:
+                    q["original_ai_score"] = score
+                    q["score"] = max_val
+                    score = max_val
+                    q["reasoning"] += f"\n[System Correction] Score capped at {max_val}."
+            recalc_total += score
+        res["total_score"] = recalc_total
+
+    score = _safe_float(res.get("total_score") if res.get("total_score") is not None else res.get("score"), 0.0)
+    cost_grading = _safe_float(res.get("cost_usd"), 0.0)
+    total_cost = cost_ocr + cost_grading
+    sid = rid if rid else f"S{idx+1:03d}"
+    file_path = _save_student_pdf(bid, sid, ck)
+    res["rubric"] = rubric_json 
+    res.update({
+        "Student ID": sid, "Name": rname or "Unknown", 
+        "total_score": score, "cost_usd": total_cost, 
+        "cost_breakdown": {"flash_ocr": cost_ocr, "pro_grading": cost_grading},
+        "file_path": file_path, "page_count": len(imgs)
+    })
+    return res
+##### FIXED######
+def _run_collage_batch(user, chunks, rubric_text, rubric_json, ratio, temp, mode, subject, ignore_first=False):
+    """
+    
+    針對結構化考卷優化的網格閱卷邏輯。
+    解決：1. 小題編號錯位 2. 第二位學生辨識失敗 3. 歷史紀錄細目缺失。
+    """
+    ss = st.session_state
+    status = st.empty()
+    start_t = time.time()
+    bid = _generate_meaningful_batch_id(user)
+    ss["current_batch_id"] = bid
+    student_map = []
+    
+    # --- Phase 1: 影像預處理與身份辨識 (0% ~ 33%) ---
+    _update_status(status, start_t, 0, len(chunks) * 3, t("status_phase_1"))
+    
+    for i, ck in enumerate(chunks):
+        imgs = pdf_to_images(ck)
+        # 執行身份 OCR
+        sid, name, cost = _identify_student_info(user, imgs[0], ratio)
+        dsid = sid or f"S{i+1:03d}"
+        
+        student_map.append({
+            "sid": dsid, 
+            "name": name, 
+            "cv_imgs": [cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR) for im in imgs], 
+            "cost_ocr": cost, 
+            "file_path": _save_student_pdf(bid, dsid, ck)
+        })
+        _update_status(status, start_t, i + 1, len(chunks) * 3, f"Scanning {dsid}")
+
+    # --- Phase 2: 物理佈局映射 (33% ~ 50%) ---
+    q_labels = _map_rubric_to_labels(rubric_json)
+    
+    # [FIX] 穩定排序：解決 Q1(a) 與 Q1(b) 在同頁不同位置的辨識順序
+    def stable_sort(boxes): 
+        # y // 60 將 60px 內的垂直偏差視為同一行，避免 ID 標籤跳號
+        return sorted(boxes, key=lambda b: (b[1] // 60, b[0]))
+    
+    template = []
+    s_ref = student_map[0] # 使用第一位學生作為座標基準
+    ptr = 0
+    
+    for p_idx, img in enumerate(s_ref["cv_imgs"]):
+        aligned = VisionService.align_document(img)
+        # 偵測考卷上的所有作答框
+        boxes, _ = VisionService.detect_answer_areas(
+            aligned, 
+            is_first_page=(p_idx == 0), 
+            manual_p1_ratio=ratio
+        )
+        
+        if ignore_first and p_idx == 0 and boxes: 
+            boxes.pop(0)
+            
+        # 套用穩定排序，將題號標籤與物理區域 1:1 綁定
+        for b in stable_sort(boxes):
+            if ptr < len(q_labels):
+                lbl = q_labels[ptr]
+                template.append({"page": p_idx, "box": b, "label": lbl})
+                ptr += 1
+
+    # 切割題目影像並分類
+    q_batches = {l: [] for l in q_labels}
+    for stu in student_map:
+        for m in template:
+            if m["page"] < len(stu["cv_imgs"]):
+                crops = VisionService.crop_images_by_layout(
+                    VisionService.align_document(stu["cv_imgs"][m["page"]]), 
+                    [m["box"]]
+                )
+                if crops: 
+                    q_batches[m["label"]].append({"sid": stu["sid"], "img": crops[0]})
+
+    # --- Phase 3: AI 批改與結果封裝 (50% ~ 100%) ---
+    final_grades = {
+        s["sid"]: {
+            "Student ID": s["sid"], "Name": s["name"] or "Unknown", 
+            "questions": [], "total_score": 0, "cost_usd": s["cost_ocr"], 
+            "file_path": s["file_path"], "rubric": rubric_json
+        } for s in student_map
+    }
+    
+    proc = AtomicBatchProcessor()
+    futures = []
+    
+    with ThreadPoolExecutor(max_workers=_get_max_workers(user)) as ex:
+        for q_id, items in q_batches.items():
+            for ab in proc.create_batches(items):
+                v_ids = [c['index'] for c in ab['manifest']['cells'] if not c['is_empty']]
+                f = ex.submit(
+                    GradingService.grade_collage_submission, 
+                    Image.fromarray(cv2.cvtColor(ab['image'], cv2.COLOR_BGR2RGB)), 
+                    q_id, ss.get("rubric_content", ""), user, mode, subject, temp, 
+                    "gemini-2.5-pro", q_labels, v_ids, ss.get("language", "繁體中文")
+                )
+                futures.append((f, q_id, ab['manifest']))
+        
+        done_grids = 0
+        total_grids = len(futures)
+        
+        for f, q_id, mani in futures:
+            try:
+                res_data = f.result(timeout=150)
+                ai_res = res_data.get("results", [])
+                max_v = _find_max_score_in_rubric_json(rubric_json, q_id)
+                
+                for cell in mani['cells']:
+                    if cell['is_empty']: continue
+                    
+                    # 依據視覺 Index 尋找 AI 回傳結果
+                    item = next((r for r in ai_res if r.get("index") == cell['index']), None)
+                    
+                    # [CRITICAL] 強制封裝 breakdown，解決「AUTO: 0 pts」與歷史紀錄問題
+                    q_data = {
+                        "id": q_id, 
+                        "score": min(float(item.get("score", 0)) if item else 0.0, max_v or 99), 
+                        "reasoning": item.get("reasoning", "") if item else "NO DATA (辨識失敗)", 
+                        "breakdown": item.get("breakdown", []) if item else [] # 此行不可刪除
+                    }
+                    
+                    if cell['sid'] in final_grades:
+                        final_grades[cell['sid']]["questions"].append(q_data)
+                        final_grades[cell['sid']]["total_score"] += q_data["score"]
+                        final_grades[cell['sid']]["cost_usd"] += (res_data.get("cost_usd", 0) / max(1, len(v_ids)))
+            except Exception as e:
+                logging.error(f"Batch Error: {e}")
+            
+            done_grids += 1
+            current_prog = (len(chunks) * 1.5) + (done_grids / max(1, total_grids) * (len(chunks) * 1.5))
+            _update_status(status, start_t, current_prog, len(chunks) * 3, f"Grading {q_id}")
+
+    # 存檔並結束
+    res_list = list(final_grades.values())
+    save_batch_results(user.id, bid, res_list)
+    ss.update({"grading_results": res_list, "current_step": 3})
+    st.rerun()
+
+##########
+
+#####
+def render_step_3_report(user):
+    ss = st.session_state
+    res = ss.get("grading_results", [])
+    # 解決 UNK 問題：優先從 session 拿，拿不到就從結果的第一筆拿
+    bid = ss.get("current_batch_id", res[0].get("batch_id", "Manual_Batch") if res else "UNK")
+    rubric_json = ss.get("rubric_json", {})
+    
+    if not res: 
+        st.warning(t("no_results_yet"))
+        return
+
+    # 1. 資料處理：忽略回傳的舊 cost，改用手動精確加總
+    df, _ = merge_and_calculate_data(res)
+    if "Final Score" not in df.columns: 
+        df["Final Score"] = 0.0
+    q_stats_df = analyze_questions_performance(res, rubric_json)
+    
+    st.success(f"✅ {t('batch_complete')} (ID: {bid})")
+    
+    # 2. 顯示成績表格
+    st.dataframe(df, use_container_width=True)
+
+    # 3. 統計圖表區 (使用 try-except 保護)
+    st.subheader(f"📊 {t('statistics_overview')}")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"##### 📈 {t('chart_score_dist', 'Score Dist')}")
+        try:
+            fig = generate_score_distribution_chart(df)
+            if fig:
+                st.pyplot(fig)
+                plt.close(fig)
+        except: pass
+    with c2:
+        st.markdown(f"##### 📉 {t('chart_question_analysis', 'Analysis')}")
+        try:
+            fig = generate_question_analysis_chart(q_stats_df)
+            if fig: 
+                st.pyplot(fig)
+                plt.close(fig)
+        except: pass
+
+    st.markdown("---")
+
+    # 4. [CRITICAL FIX] 成本分析加總邏輯對齊
+    # 對應 _run_collage_batch 中的存檔 Key: cost_ocr 與 cost_usd
+    total_flash = sum([float(r.get("cost_ocr", 0)) for r in res])
+    total_pro = sum([float(r.get("cost_usd", 0)) for r in res])
+    total_sum = total_flash + total_pro
+
+    st.markdown(f"#### 💰 {t('hdr_cost_analysis', 'Cost')}")
+    c1_c, c2_c, c3_c = st.columns(3)
+    # 使用小數點後四位確保 0.029 能被看見
+    c1_c.metric("⚡ Flash (OCR)", f"${total_flash:.4f}")
+    c2_c.metric("🧠 Pro (Grading)", f"${total_pro:.4f}")
+    c3_c.metric("💵 Total", f"${total_sum:.4f}")
+    
+    # 5. 成績平均與及格率
+    m1, m2, m3, m4 = st.columns(4)
+    scores = df["Final Score"]
+    pass_len = len(scores[scores >= 60])
+    m1.metric(t("average_score"), f"{scores.mean():.1f}")
+    m2.metric(t("median_score"), f"{scores.median():.1f}")
+    m3.metric(t("pass_count"), f"{pass_len}")
+    m4.metric(t("pass_rate"), f"{(pass_len/len(scores)*100 if len(scores) else 0):.1f}%")
+
+    # 6. AI 班級分析報告
+    if st.button(f"✨ {t('gen_class_analysis_btn')}", type="primary"):
+        with st.spinner(t("analyzing")):
+            ss["class_analysis"] = generate_class_analysis(
+                res, ss.get("rubric_content", ""), user.google_api_key, 
+                report_mode=ss.get("report_mode", "simple"), 
+                language=ss.get("language", "繁體中文")
+            )
+            st.rerun()
+            
+    # 7. 下載區域 (PDF 與 ZIP)
+    pdf_bytes = None
+    if "class_analysis" in ss:
+        st.markdown("---")
+        st.markdown(ss["class_analysis"])
+        pdf_cache_key = f"pdf_cache_{bid}"
+        if pdf_cache_key not in ss:
+            with st.spinner(t("msg_generating_pdf")):
+                try: 
+                    ss[pdf_cache_key] = PdfReportWorker.generate_professional_pdf(bid, df, ss["class_analysis"], user=user, q_stats_df=q_stats_df)
+                except Exception as e: st.error(f"PDF Error: {e}")
+        pdf_bytes = ss.get(pdf_cache_key)
+        if pdf_bytes: 
+            st.download_button(t("btn_download_pdf"), pdf_bytes, f"{bid}.pdf", "application/pdf")
+
+    zip_buf = create_advanced_zip_report(bid, df, ss.get("class_analysis", ""), q_stats_df=q_stats_df, pdf_bytes=pdf_bytes)
+    st.download_button(t("download_zip_btn"), zip_buf, f"{bid}.zip", "application/zip", type="primary")
+    
+    # 8. 重置 Session 按鈕
+    if st.button(f"🔄 {t('btn_new_session', 'New Session')}"):
+        keys_to_clear = [
+            "grading_results", "exam_chunks", "class_analysis", 
+            "layout_map", "rubric_editor_lock_final", "rubric_json"
+        ]
+        for k in keys_to_clear: ss.pop(k, None)
+        pdf_cache_key = f"pdf_cache_{bid}"
+        if pdf_cache_key in ss: del ss[pdf_cache_key]
+        ss["current_step"] = 1
+        st.rerun()
+
+
+#####
+def render_step_3_report1(user):
+    ss = st.session_state
+    res = ss.get("grading_results", [])
+    bid = ss.get("current_batch_id", "UNK")
+    rubric_json = ss.get("rubric_json", {})
+    if not res: st.warning(t("no_results_yet")); return
+
+    df, cost = merge_and_calculate_data(res)
+    if "Final Score" not in df.columns: df["Final Score"] = 0.0
+    q_stats_df = analyze_questions_performance(res, rubric_json)
+    
+    st.success(f"✅ {t('batch_complete')}")
+    st.dataframe(df)
+
+    st.subheader(f"📊 {t('statistics_overview')}")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"##### 📈 {t('chart_score_dist', 'Score Dist')}")
+        try:
+            fig = generate_score_distribution_chart(df)
+            if fig:
+                st.pyplot(fig)
+                plt.close(fig)
+        except: pass
+    with c2:
+        st.markdown(f"##### 📉 {t('chart_question_analysis', 'Analysis')}")
+        try:
+            fig = generate_question_analysis_chart(q_stats_df)
+            if fig: 
+                st.pyplot(fig)
+                plt.close(fig)
+        except: pass
+
+    st.markdown("---")
+    total_flash = sum([r.get("cost_breakdown", {}).get("flash_ocr", 0) for r in res])
+    total_pro = sum([r.get("cost_breakdown", {}).get("pro_grading", 0) for r in res])
+    total_sum = total_flash + total_pro
+    st.markdown(f"#### 💰 {t('hdr_cost_analysis', 'Cost')}")
+    c1_c, c2_c, c3_c = st.columns(3)
+    c1_c.metric("⚡ Flash (OCR)", f"${total_flash:.4f}")
+    c2_c.metric("🧠 Pro (Grading)", f"${total_pro:.4f}")
+    c3_c.metric("💵 Total", f"${total_sum:.4f}")
+    
+    m1, m2, m3, m4 = st.columns(4)
+    scores = df["Final Score"]
+    pass_len = len(scores[scores >= 60])
+    m1.metric(t("average_score"), f"{scores.mean():.1f}")
+    m2.metric(t("median_score"), f"{scores.median():.1f}")
+    m3.metric(t("pass_count"), f"{pass_len}")
+    m4.metric(t("pass_rate"), f"{(pass_len/len(scores)*100 if len(scores) else 0):.1f}%")
+
+    if st.button(f"✨ {t('gen_class_analysis_btn')}", type="primary"):
+        with st.spinner(t("analyzing")):
+            ss["class_analysis"] = generate_class_analysis(
+                res, ss.get("rubric_content", ""), user.google_api_key, 
+                report_mode=ss.get("report_mode", "simple"), language=ss.get("language", "繁體中文")
+            )
+            st.rerun()
+            
+    pdf_bytes = None
+    if "class_analysis" in ss:
+        st.markdown(ss["class_analysis"])
+        pdf_cache_key = f"pdf_cache_{bid}"
+        if pdf_cache_key not in ss:
+            with st.spinner(t("msg_generating_pdf", "Generating PDF...")):
+                try: 
+                    ss[pdf_cache_key] = PdfReportWorker.generate_professional_pdf(bid, df, ss["class_analysis"], user=user, q_stats_df=q_stats_df)
+                except Exception as e: st.error(f"PDF Error: {e}")
+        pdf_bytes = ss.get(pdf_cache_key)
+        if pdf_bytes: st.download_button(t("btn_download_pdf", "Download PDF"), pdf_bytes, f"{bid}.pdf", "application/pdf")
+
+    zip_buf = create_advanced_zip_report(bid, df, ss.get("class_analysis", ""), q_stats_df=q_stats_df, pdf_bytes=pdf_bytes)
+    st.download_button(t("btn_download_zip", "Download ZIP"), zip_buf, f"{bid}.zip", "application/zip", type="primary")
+    
+    if st.button(f"🔄 {t('btn_new_session', 'New Session')}"):
+        for k in ["grading_results", "exam_chunks", "class_analysis", "layout_map", "rubric_editor_lock_final", "rubric_json"]: ss.pop(k, None)
+        pdf_cache_key = f"pdf_cache_{bid}"
+        if pdf_cache_key in ss: del ss[pdf_cache_key]
+        ss["current_step"] = 1; st.rerun()
+
+def render_dashboard(user):
+    user_api_key = getattr(user, 'google_api_key', None)
+    if not user_api_key or not str(user_api_key).strip():
+        st.error("BYOK_REQUIRED: Missing API Key. Please configure your Gemini API Key in Settings.")
+        st.info(f"💡 {t('msg_no_api_key', 'No API Key')}")
+        st.warning(f"⚠️ {t('msg_system_locked', 'Locked')}")
+        st.stop()
+ 
+    st.title(t("app_title"))
+    with st.sidebar:
+        # [NEW] 1. 語言選擇器 (Language Selector)
+        st.subheader("🌐 Language")
+        lang_options = {"繁體中文": "zh_tw", "English": "en"}
+        
+        # 讀取當前設定 (反查 Key)
+        current_code = st.session_state.get("lang_code", "zh_tw")
+        current_label = "繁體中文"
+        for k, v in lang_options.items():
+            if v == current_code:
+                current_label = k
+                break
+        
+        # 顯示選單
+        selected_label = st.selectbox(
+            "Select Language",
+            options=list(lang_options.keys()),
+            index=list(lang_options.keys()).index(current_label),
+            key="language_selector_ui"
+        )
+        
+        # 更新 Session State
+        new_code = lang_options[selected_label]
+        if new_code != current_code:
+            st.session_state["lang_code"] = new_code
+            st.session_state["language"] = selected_label # 給 AI Service 用的
+            st.rerun()
+
+        st.markdown("---")
+        st.subheader(f"📊 {t('usage_header')}")
+        current_p = get_user_weekly_page_count(user.id)
+        custom_page = int(getattr(user, 'custom_page_limit', 0) or 0)
+        if custom_page > 0: limit_p = custom_page
+        else:
+            plan_key = f"QUOTA_{user.plan.upper()}_WEEKLY_PAGES"
+            fallback = {"free": 70, "pro": 500, "premium": 1000, "enterprise": 5000}.get(user.plan, 70)
+            limit_p = int(get_sys_conf(plan_key) or fallback)
+
+        p_ratio = min(current_p / limit_p, 1.0) if limit_p > 0 else 0
+        st.write(f"📖 {t('pps_label')}: {current_p} / {limit_p}")
+        st.progress(p_ratio)
+        if p_ratio >= 1.0: st.error(t('quota_exceeded_msg'))
+        st.markdown("---")
+
+    if "current_step" not in st.session_state: st.session_state["current_step"] = 1
+    step = st.session_state["current_step"]; render_step_indicator(step)
+    if step == 1: render_step_1_rubric(user)
+    elif step == 2: render_step_2_grading(user)
+    elif step == 3: render_step_3_report(user)

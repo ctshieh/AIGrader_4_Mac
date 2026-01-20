@@ -4,6 +4,128 @@
 STRINGS = {
     # --- [New] On-Premise / Institutional Branding ---
     "app_title": "AI Grading System",
+    "msg_please_upload_first_en": "Upload Question PDF or Paste Rubric JSON.",
+     "hdr_grading_config": "Grading Settings",
+    "lbl_rubric_granularity": "Rubric Granularity",
+    "opt_gran_coarse": "Concise",
+    "opt_gran_standard": "Standard",
+    "opt_gran_diagnostic": "Diagnostic",
+    "help_granularity": "Concise: focus on key formulas and final results | Standard: automatically break down core steps by point allocation | Diagnostic: include minor details such as algebraic simplification",
+    #
+    "err_invalid_format":"Invalid file format. Only PDF files are supported.",
+    # --- Brand & Slogan ---
+    "app_name": "AI Grader for STEM",
+    "desc_secure_grading": "K-16 STEM AI: Intelligent Question Gen, Automated Grading & Diagnostic Analysis",
+    "footer_text": "AI Grader for STEM\\nPowered by @2026 Nexora Systems",
+
+    # --- System Activation ---
+    "hdr_license_setup": "🔐 System Activation & License Setup",
+    "msg_license_init": "Please activate your license to start the system.",
+    "msg_copy_mid": "☝️ Copy the Machine ID above and provide it to support.",
+    "lbl_license_file": "License File",
+    "btn_select_license": "Open System Dialog to Select License",
+    "btn_select_logo": "Open System Dialog to Select Logo",
+    "msg_license_imported": "License successfully imported!",
+    "msg_logo_imported": "Logo successfully imported!",
+
+    # --- Sidebar & Navigation ---
+    "mode_creator": "Creator Mode",
+    "mode_grader": "Grader Mode",
+    "switch_mode": "Switch Workspace",
+    "logout": "Logout",
+    # --- [NEW] Portal View ---
+    "portal_header": "Welcome back, {}",
+    "portal_sub": "Please select your workspace:",
+    "mode_creator_title": "Exam Creator",
+    "mode_creator_desc": """
+    - Design exams, typeset LaTeX, write solutions & rubrics.
+    - Supports **AI RAG Generation (Business)** & Archive Mgmt.
+    """,
+    "mode_grader_title": "Grading Cockpit",
+    "mode_grader_desc": """
+    - Upload scans, execute AI grading, generate reports.
+    - Supports high-precision horizontal grading & class analysis.
+    """,
+    "btn_enter_creator": "Enter Creator Mode",
+    "btn_enter_grader": "Enter Grader Mode",
+    "plan_label": "Current Plan",
+    # --- [NEW] Question Bank 3.0 ---
+    "tab_q_list": "Question List",
+    "tab_q_sets": "Question Sets",
+    "tab_q_add": "Add Question",
+    
+    "lbl_filter": "Filters",
+    "lbl_classification": "Classification",
+    "lbl_section": "Section",
+    "lbl_difficulty": "Difficulty",
+    
+    "opt_create_new": "✏️ Create New...",
+    "lbl_new_subj": "Enter New Subject",
+    "lbl_new_chap": "Enter New Chapter",
+    "lbl_new_sec": "Enter New Section",
+    
+    "lbl_cart": "Cart",
+    "btn_save_set": "Save as Set",
+    "lbl_set_name": "Set Name",
+    "lbl_desc": "Description",
+    "btn_confirm_save": "Save",
+    "btn_clear": "Clear Selection",
+    "lbl_showing": "Showing",
+    "lbl_items": "items",
+    "lbl_uncategorized": "Uncategorized",
+    "lbl_subs_count": "Sub-questions",
+    
+    "header_my_sets": "My Question Sets",
+    "msg_no_sets": "You haven't created any sets yet.",
+    "lbl_select_set": "Select Set",
+    "lbl_contains": "Contains",
+    "lbl_qs": "questions",
+    "btn_load_cart": "Load to Cart",
+    "btn_del_set": "Delete Set",
+    "msg_loaded": "Loaded to Cart!",
+    "msg_deleted": "Deleted",
+
+    "header_add_q": "Add Question",
+    "header_edit_q": "Edit Question",
+    "lbl_content": "Question Content",
+    "lbl_q_text": "Question Text (LaTeX supported)",
+    "gen_type_label": "Type",
+    "gen_height_label": "Height (cm)",
+    "gen_subs_check": "Has Sub-questions",
+    "mode_choice": "🔹 Multiple Choice Mode",
+    "lbl_options": "Options (One per line)",
+    "mode_composite": "🔹 Composite Mode",
+    "lbl_layout_cols": "Layout Columns",
+    "lbl_sub_count": "Sub-question Count",
+    "lbl_sub_q": "Sub-question",
+    "lbl_media": "Media Attachments",
+    "tab_upload_img": "Upload Image",
+    "tab_tikz": "TikZ Code",
+    "lbl_img_file": "Select Image",
+    "lbl_tikz_code": "Enter TikZ Code",
+    
+    "btn_save": "Save",
+    "btn_save_changes": "💾 Save Changes",
+    "btn_add_confirm": "💾 Confirm Add",
+    "btn_cancel": "Cancel",
+    
+    "err_no_title": "Please enter a title",
+    "err_empty_content": "Question content cannot be empty",
+    "err_missing_meta": "Please complete Subject, Chapter, and Section",
+    "err_save_fail": "Save Failed",
+    "msg_q_saved": "Question Saved!",
+    "msg_add_success": "✅ Question Added Successfully!",
+    "msg_update_success": "✅ Update Successful!",
+
+    "type_calc_normal": "Calculation (Normal)",
+    "type_calc_large": "Calculation (Large)",
+    "type_choice": "Multiple Choice",
+    "type_proof": "Proof",
+    "type_tf": "True/False",
+    "type_fill": "Fill-in-the-blank",
+    "diff_easy": "🟢 Easy",
+    "diff_medium": "🟡 Medium",
+    "diff_hard": "🔴 Hard",
     # --- [Missing Keys Fix] v18.0.1 Settings & Maintenance ---
     "settings_general": "General Settings",
     "lbl_language": "Interface Language",
@@ -81,7 +203,6 @@ STRINGS = {
     "adv_quota_title": "Custom Quota Management",
     "adv_quota_desc": "Flexible resource allocation tailored to institutional needs.", 
     "badge_exclusive_license": "Exclusive License",
-    "desc_secure_grading": "Secure environment for academic research and professional grading.",
     "stat_connected": "Connected",
     "stat_protected": "Protected",
     "lbl_net_status": "Network Status",

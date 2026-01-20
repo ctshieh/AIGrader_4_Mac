@@ -3,7 +3,127 @@
 
 STRINGS = {
      "app_title": "AI 自動採点システム", 
-        # --- [New] On-Premise / Institutional Branding ---
+     # --- [NEW] Question Bank 3.0 ---
+    # --- ブランド標語 ---
+    "app_name": "AI Grader for STEM",
+    "desc_secure_grading": "K-16 STEM AI：知能的出題・自動採点・学習診断システム",
+    "footer_text": "AI Grader for STEM\\nPowered by @2026 Nexora Systems",
+    "err_invalid_format":"ファイル形式が正しくありません。PDFファイルのみ対応しています。",
+
+    # --- ライセンス設定 ---
+    "hdr_license_setup": "🔐 システムライセンス設定 (Activation)",
+    "msg_license_init": "システムを起動するには、ライセンスを有効にしてください。",
+    "msg_copy_mid": "☝️ 上記のデバイスIDをコピーして、サポートに提供してください。",
+    "lbl_license_file": "ライセンスファイル",
+    "btn_select_license": "システムダイアログでライセンスを選択",
+    "btn_select_logo": "システムダイアログでロゴを選択",
+    "msg_license_imported": "ライセンスがインポートされました！",
+    "msg_logo_imported": "ロゴがインポートされました！",
+
+    # --- サイドバー ---
+    "mode_creator": "作成センター",
+    "mode_grader": "採点センター",
+    "switch_mode": "ワークスペースを切り替える",
+    "logout": "ログアウト",
+    "tab_q_list": "問題リスト",
+    "tab_q_sets": "問題セット",
+    "tab_q_add": "問題追加",
+    # --- [NEW] Portal View ---
+    "portal_header": "お帰りなさい, {}",
+    "portal_sub": "ワークスペースを選択してください：",
+    "mode_creator_title": "作成センター (Creator)",
+    "mode_creator_desc": """
+    - 試験デザイン、LaTeX組版、解答・基準作成。
+    - **AI 作問支援 (Business)** と過去問管理に対応。
+    """,
+    "mode_grader_title": "採点センター (Grader)",
+    "mode_grader_desc": """
+    - スキャン画像のアップロード、AI採点、統計レポート。
+    - 高精度な水平採点とクラス分析に対応。
+    """,
+    "btn_enter_creator": "作成モードへ",
+    "btn_enter_grader": "採点モードへ",
+    "plan_label": "プラン",   
+    "lbl_filter": "フィルター",
+    "lbl_classification": "分類設定",
+    "lbl_section": "節 (Section)",
+    "lbl_difficulty": "難易度",
+    
+    "opt_create_new": "✏️ 新規作成...",
+    "lbl_new_subj": "新しい科目名",
+    "lbl_new_chap": "新しい章名",
+    "lbl_new_sec": "新しい節名",
+    
+    "lbl_cart": "カート",
+    "btn_save_set": "セットとして保存",
+    "lbl_set_name": "セット名",
+    "lbl_desc": "説明",
+    "btn_confirm_save": "保存",
+    "btn_clear": "選択解除",
+    "lbl_showing": "表示中",
+    "lbl_items": "件",
+    "lbl_uncategorized": "未分類",
+    "lbl_subs_count": "小問数",
+    
+    "header_my_sets": "マイ問題セット",
+    "msg_no_sets": "セットはまだありません。",
+    "lbl_select_set": "セット選択",
+    "lbl_contains": "含む",
+    "lbl_qs": "問",
+    "btn_load_cart": "カートにロード",
+    "btn_del_set": "セット削除",
+    "msg_loaded": "ロードしました！",
+    "msg_deleted": "削除しました",
+
+    "header_add_q": "問題を追加",
+    "header_edit_q": "問題を編集",
+    "lbl_content": "問題内容",
+    "lbl_q_text": "問題文 (LaTeX対応)",
+    "gen_type_label": "タイプ",
+    "gen_height_label": "回答欄の高さ (cm)",
+    "gen_subs_check": "小問あり",
+    "mode_choice": "🔹 多肢選択モード",
+    "lbl_options": "選択肢 (1行に1つ)",
+    "mode_composite": "🔹 複合モード",
+    "lbl_layout_cols": "レイアウト列",
+    "lbl_sub_count": "小問数",
+    "lbl_sub_q": "小問",
+    "lbl_media": "メディア添付",
+    "tab_upload_img": "画像",
+    "tab_tikz": "TikZコード",
+    "lbl_img_file": "画像を選択",
+    "lbl_tikz_code": "TikZコードを入力",
+    
+    "btn_save": "保存",
+    "btn_save_changes": "💾 変更を保存",
+    "btn_add_confirm": "💾 追加を確定",
+    "btn_cancel": "キャンセル",
+    
+    "err_no_title": "タイトルを入力してください",
+    "err_empty_content": "問題内容は空にできません",
+    "err_missing_meta": "科目、章、節をすべて入力してください",
+    "err_save_fail": "保存失敗",
+    "msg_q_saved": "保存しました！",
+    "msg_add_success": "✅ 問題を追加しました！",
+    "msg_update_success": "✅ 更新に成功しました！",
+
+    "type_calc_normal": "計算問題 (標準)",
+    "type_calc_large": "計算問題 (大)",
+    "type_choice": "多肢選択",
+    "type_proof": "証明問題",
+    "type_tf": "正誤問題",
+    "type_fill": "穴埋め問題",
+    "diff_easy": "🟢 簡単",
+    "diff_medium": "🟡 普通",
+    "diff_hard": "🔴 難しい",      
+ # --- [New] On-Premise / Institutional Branding ---
+     "msg_please_upload_first": "問題PDFをアップロード、またはRubric JSONを貼り付け",
+    "hdr_grading_config": "採点設定",
+    "lbl_rubric_granularity": "採点の詳細度",
+    "opt_gran_coarse": "簡易",
+    "opt_gran_standard": "標準",
+    "opt_gran_diagnostic": "診断",
+    "help_granularity": "簡易：重要な式と最終結果のみ確認 | 標準：配点に基づき主要ステップを自動分解 | 診断：代数的整理（簡約）など細かな点も含む",
     # --- [Missing Keys Fix] v18.0.1 Settings & Maintenance ---
     "settings_general": "一般設定",
     "lbl_language": "表示言語",
@@ -48,7 +168,6 @@ STRINGS = {
     "adv_quota_title": "カスタムクォータ管理",
     "adv_quota_desc": "機関のニーズに合わせてリソースを柔軟に配分し、安定運用を実現。",
     "badge_exclusive_license": "機関専用ライセンス",
-    "desc_secure_grading": "学術研究と専門採点のための専用環境",
     "stat_connected": "接続済み",
     "stat_protected": "保護済み",
     "lbl_net_status": "ネットワーク状態",

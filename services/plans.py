@@ -1,39 +1,55 @@
 # services/plans.py
 # -*- coding: utf-8 -*-
-# [Security Critical] 授權規則定義檔 (Compiled into EXE)
+# Module-Version: v2026.01.23-Feature-Flag-Ready
+# Description: 修正 get_plan_config 以支援 features 參數，解決 TypeError。
 
 PLAN_LIMITS = {
-    # ---------------------------------------------------------
-    # 1. 個人版 (Personal) - 賣給個別老師
-    # 特性：單機單人，"設定"頁面即後台
-    # ---------------------------------------------------------
+    "free": {
+        "name": "試用版 (Free)",
+        "grading_pages": 10,
+        "exam_gen_quota": 3,
+        "ai_gen_enabled": False,
+        "ai_gen_batch_limit": 0,
+        "branding_enabled": False,
+        "show_admin": False
+    },
     "personal": {
         "name": "個人版 (Personal)",
-        "grading_pages": 300,           # [修正] 提升至 300 頁/週
-        "exam_gen": 30,                 # 每週出卷 30 份
-        "max_workers": 4,               # 運算速度 (普通)
-        "allow_register": False,        # 禁止註冊
-        "show_admin": False,            # 不顯示 Admin
-        "branding": False,              # 不可換 Logo
-        "has_subscription": False       # 無訂閱功能
+        "grading_pages": 300,
+        "exam_gen_quota": 30,
+        "ai_gen_enabled": True,
+        "ai_gen_batch_limit": 10,
+        "branding_enabled": False,
+        "show_admin": False
     },
-
-    # ---------------------------------------------------------
-    # 2. 機構版 (Business) - 賣給補習班/學校
-    # 特性：買斷授權，可管理內部員工
-    # ---------------------------------------------------------
     "business": {
         "name": "機構版 (Business)",
-        "grading_pages": 5000,          # 每週 5000 頁 (多人共用)
-        "exam_gen": 1000,               # 每週 1000 份
-        "max_workers": 8,               # 運算速度 (快)
-        "allow_register": True,         # 允許內部員工註冊
-        "show_admin": True,             # 顯示 Admin 後台
-        "branding": True,               # 允許換 Logo
-        "has_subscription": False       # 無訂閱功能 (防止競業)
+        "grading_pages": 5000,
+        "exam_gen_quota": 1000,
+        "ai_gen_enabled": True,
+        "ai_gen_batch_limit": 20,
+        "branding_enabled": True,
+        "show_admin": True
     }
 }
 
-def get_plan_config(plan_name: str):
-    """取得方案設定，若找不到則預設為 personal"""
-    return PLAN_LIMITS.get(plan_name, PLAN_LIMITS["personal"])
+# [FIX] 增加 features 參數 (預設 None)
+def get_plan_config(plan_name: str, features: list = None):
+    """
+    取得方案設定
+    Args:
+        plan_name: 方案名稱 (free/personal/business)
+        features: License 功能列表 (用於判斷 superuser)
+    """
+    key = str(plan_name).lower()
+    config = PLAN_LIMITS.get(key, PLAN_LIMITS["personal"]).copy()
+    
+    # 開發者上帝模式 (Superuser)
+    if features and "superuser" in features:
+        config["name"] = f"{config['name']} (Dev)"
+        config["ai_gen_batch_limit"] = 100
+        config["exam_gen_quota"] = 99999
+        config["show_admin"] = True
+        config["branding_enabled"] = True
+        
+    return config

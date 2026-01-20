@@ -1,0 +1,217 @@
+# Copyright (c) 2026 [謝忠村/Chung Tsun Shieh]. All Rights Reserved.
+# app.py
+# -*- coding: utf-8 -*-
+# Module-Version: v2026.01.23-Final-Restore
+# Description: 
+# 1. [Sidebar] 恢復語言切換 (Language Selector)。
+# 2. [Menu] 確保選單正確顯示並能與導入功能連動。
+# 3. [Fix] Ghost Button 與 初始化順序修正。
+
+import streamlit as st
+import sys
+import os
+from dotenv import load_dotenv
+
+# ==============================================================================
+# 1. 系統初始化 (CRITICAL: 必須是第一行)
+# ==============================================================================
+st.set_page_config(
+    page_title="Math AI Grader Pro", 
+    page_icon="📝", 
+    layout="wide", 
+    initial_sidebar_state="expanded" 
+)
+
+# ==============================================================================
+# 2. CSS 樣式
+# ==============================================================================
+st.markdown("""
+    <style>
+    [data-testid="stSidebar"] { color: #333333 !important; background-color: #FAFAFA; }
+    [data-testid="stSidebar"] p { font-size: 15px !important; color: #333333 !important; }
+    [data-testid="stSidebarCollapsedControl"] {
+        display: block !important;
+        color: black !important;
+        background-color: rgba(200, 200, 200, 0.4) !important; 
+        border-radius: 0 8px 8px 0;
+        z-index: 999999;
+    }
+    .mode-box {
+        background-color: #E6F2FF;
+        border: 1px solid #CCE5FF;
+        color: #0056b3;
+        padding: 12px;
+        border-radius: 6px;
+        margin-bottom: 12px;
+        font-weight: bold;
+        display: flex; align-items: center; gap: 8px;
+    }
+    .support-btn {
+        width: 100%; background-color: white; border: 1px solid #dddddd;
+        border-radius: 20px; padding: 10px 0; color: #0066cc;
+        text-align: center; font-weight: bold; margin-top: 40px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05); cursor: default;
+    }
+    .stRadio > div { gap: 12px; }
+    </style>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# 3. 模組載入
+# ==============================================================================
+try:
+    from utils.paths import get_resource_path, get_writable_path
+    from utils.localization import t
+    from services.security import verify_license_tier, get_fingerprint_for_ui
+    from database.db_manager import init_db, login_user
+    from services.auth_service import validate_session, logout_user
+    from services.plans import get_plan_config
+    
+    from ui.login_view import render_login
+    from ui.portal_view import render_portal
+    from ui.dashboard_view import render_dashboard
+    from ui.exam_gen_view import render_exam_generator
+    from ui.history_view import render_history
+    from ui.settings_view import render_settings
+    from ui.admin_view import render_admin
+    from ui.my_exams_view import render_my_exams_view
+    from ui.question_bank_view import render_question_bank
+    
+    from utils.styles import apply_mac_style
+    import matplotlib.pyplot as plt
+except ImportError as e:
+    st.error(f"❌ Startup Error: {e}")
+    st.stop()
+
+LICENSE_PATH = get_writable_path("license.key")
+
+# ==============================================================================
+# 4. 主程式邏輯
+# ==============================================================================
+def check_license_gatekeeper():
+    if not os.path.exists(LICENSE_PATH): return False
+    try:
+        is_valid, message, plan, title = verify_license_tier(LICENSE_PATH)
+        if not is_valid:
+            st.error(f"⛔ License Invalid: {message}"); return False
+        st.session_state["SYSTEM_PLAN"] = plan
+        st.session_state["APP_TITLE"] = title
+        if "license_data" not in st.session_state:
+            st.session_state["license_data"] = {"features": []} 
+        return True
+    except: return False
+
+load_dotenv()
+init_db()
+
+def main_app():
+    if not check_license_gatekeeper():
+        st.warning("⚠️ 請上傳有效的 license.key"); st.stop()
+
+    if "is_authenticated" not in st.session_state:
+        st.session_state.update({"is_authenticated": False, "lang": "zh_tw"})
+    
+    if not st.session_state["is_authenticated"]:
+        render_login(); return
+
+    user = st.session_state["user"]
+    user.plan = st.session_state.get("SYSTEM_PLAN", "free")
+
+    if "app_mode" not in st.session_state:
+        render_portal(user); return
+
+    app_mode = st.session_state.app_mode
+
+    with st.sidebar:
+        st.subheader(f"Hi, {user.real_name or user.username}")
+        
+        # [RESTORED] 語言選擇
+        st.caption("Language / Langue")
+        st.selectbox("Lang", ["🇹🇼 繁體中文", "🇺🇸 English"], key="lang_sel", label_visibility="collapsed")
+        st.write("") 
+
+        # 模式顯示
+        mode_icon = "📝" if app_mode == "creator" else "📈"
+        mode_text = "出卷中心" if app_mode == "creator" else "閱卷中心"
+        st.markdown(f'<div class="mode-box">{mode_icon} Mode: {mode_text}</div>', unsafe_allow_html=True)
+        
+        if st.button("🏠 切換工作模式", use_container_width=True, type="primary"):
+            del st.session_state.app_mode
+            if "page_selection" in st.session_state: del st.session_state.page_selection
+            st.rerun()
+
+        st.markdown("---")
+        st.caption("試卷設計與管理")
+        
+        # 選單結構
+        if app_mode == "creator":
+            menu_structure = [
+                ("menu_exam_gen", "試卷生成", render_exam_generator),
+                ("menu_my_exams", "我的試卷庫", render_my_exams_view),
+                ("menu_bank", "題庫中心", render_question_bank),
+                ("menu_settings", "個人設定", render_settings),
+            ]
+            plan_config = get_plan_config(user.plan, st.session_state.get("license_data", {}).get("features", []))
+            if getattr(user, "is_admin", False) and plan_config.get("show_admin", False):
+                menu_structure.append(("menu_admin", "系統管理", render_admin))
+        else:
+            menu_structure = [
+                ("menu_grading", "閱卷儀表板", render_dashboard),
+                ("menu_history", "歷史紀錄", render_history),
+                ("menu_settings", "個人設定", render_settings),
+            ]
+
+        # 頁面導航邏輯 (支援從其他頁面跳轉，如 my_exams)
+        raw_labels = [m[1] for m in menu_structure]
+        
+        # 1. 檢查 session state 是否有外部請求跳轉 (例如從 My Exams 點了導入)
+        requested_page_key = st.session_state.get("page_selection") 
+        # 將 key (menu_exam_gen) 轉換為 Label (試卷生成)
+        target_label_from_key = None
+        if requested_page_key:
+            for item in menu_structure:
+                if item[0] == requested_page_key:
+                    target_label_from_key = item[1]
+                    break
+        
+        # 2. 決定當前選取
+        current_selection = st.session_state.get("page_selection_clean", raw_labels[0])
+        
+        # 如果有外部跳轉請求，優先使用
+        if target_label_from_key and target_label_from_key in raw_labels:
+            current_selection = target_label_from_key
+            # 清除請求，避免卡死
+            st.session_state.page_selection = None 
+            st.session_state.page_selection_clean = current_selection
+
+        if current_selection not in raw_labels: current_selection = raw_labels[0]
+            
+        display_labels = []
+        for label in raw_labels:
+            if label == current_selection: display_labels.append(f"🔴 {label}")
+            else: display_labels.append(f"⚪ {label}")
+        
+        label_map = {d: m for d, m in zip(display_labels, menu_structure)}
+        curr_idx = raw_labels.index(current_selection)
+
+        sel = st.radio("Navigation", display_labels, index=curr_idx, label_visibility="collapsed", key="nav_radio")
+        
+        selected_item = label_map[sel]
+        clean_label = selected_item[1]
+        target_func = selected_item[2]
+
+        if st.session_state.get("page_selection_clean") != clean_label:
+            st.session_state.page_selection_clean = clean_label
+            st.rerun()
+
+        st.markdown("---")
+        if st.button("登出", use_container_width=True, type="secondary"):
+            logout_user(); st.rerun()
+
+        st.markdown(f'<div class="support-btn">✨ Support Mathematics</div>', unsafe_allow_html=True)
+
+    if target_func: target_func(user)
+    else: st.error(f"View not found")
+
+if __name__ == "__main__":
+    main_app()

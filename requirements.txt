@@ -1,52 +1,47 @@
-# requirements.txt
-# --- 2026.01.04 Windows/EXE 生產環境校準版 ---
-
-# 核心 AI 服務
+# === 1. 核心 AI 大腦 ===
 google-genai>=1.56.0
 openai>=1.75.0
 
-# 網頁 UI 核心
+# === 2. 網頁介面 (GUI) ===
 streamlit>=1.52.2
 extra-streamlit-components>=0.1.81
 streamlit-option-menu>=0.4.0
-
-# 數據與數學
+pywebview
+# === 3. 數學與數據核心 (您的專業需求) ===
 numpy>=1.26.0
 pandas>=2.2.0
-sympy>=1.13.0
-scipy>=1.14.0
+sympy>=1.13.0     # 處理微積分符號運算必備
+scipy>=1.14.0     # 高階數學運算
 
-# 影像處理 & PDF (關鍵修正)
-opencv-python-headless>=4.10.0.84
+# === 4. 眼睛：影像處理與 OCR ===
+opencv-python-headless>=4.10.0.84  # 掃描考卷用 (Headless 版更適合打包)
 Pillow>=10.3.0
-pymupdf>=1.24.0
-pytesseract>=0.3.13
-qrcode[pil]>=8.0.0
+pytesseract>=0.3.13  # 辨識圖片文字
+qrcode[pil]>=8.0.0   # 產生試卷 QR Code
 
-# 文件與報表
+# === 5. 手：PDF 與報表生成 ===
+#pymupdf>=1.24.0      # 高速 PDF 處理
+pdf2image>=1.17.0
 pypdf>=5.0.0
-reportlab>=4.2.0
-XlsxWriter>=3.2.0
+reportlab>=4.2.0     # 產生 PDF 成績單
+XlsxWriter>=3.2.0    # 匯出 Excel
 
-# 安全性與後端資料庫
-sqlalchemy>=2.0.30
-bcrypt>=4.1.0
+# === 6. 安全與基礎架構 ===
+sqlalchemy>=2.0.30   # 資料庫管理 (現在對接 SQLite)
+bcrypt>=4.1.0        # 密碼加密
 python-dotenv>=1.0.1
 pytz
 
-# 資料庫驅動
-psycopg2-binary>=2.9.9
-
-# 數據可視化
+# === 7. 圖表分析 ===
 matplotlib>=3.9.0
 seaborn>=0.13.0
 plotly>=5.22.0
 
-# 範本引擎
-jinja2>=3.1.4
-
-# 打包工具
+# === 8. 打包工具 ===
 pyinstaller>=6.9.0
 Cython
 setuptools
 wheel
+jinja2>=3.1.4
+### 其他 ###
+cryptography

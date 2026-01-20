@@ -1,0 +1,337 @@
+# Copyright (c) 2026 [謝忠村/Chung Tsun Shieh]. All Rights Reserved.
+# app.py
+# -*- coding: utf-8 -*-
+# Module-Version: v2026.01.23-Native-Only
+# Description: 
+# 1. [Stability] 移除了 st.file_uploader (拖放)，避免 PyWebview 誤判導致頁面跳轉。
+# 2. [Native] 僅保留系統原生檔案選取視窗 (subprocess/osascript)，確保 100% 可用。
+# 3. [UI] 介面簡化，符合桌面軟體操作邏輯。
+
+import streamlit as st
+import sys
+import os
+import time
+import shutil
+import platform
+import subprocess
+from dotenv import load_dotenv
+
+# ==============================================================================
+# 1. 系統初始化
+# ==============================================================================
+st.set_page_config(
+    page_title="Math AI Grader Pro", 
+    page_icon="📝", 
+    layout="wide", 
+    initial_sidebar_state="expanded" 
+)
+
+# ==============================================================================
+# 2. CSS 樣式
+# ==============================================================================
+st.markdown("""
+    <style>
+    [data-testid="stSidebar"] { color: #333333 !important; background-color: #FAFAFA; }
+    [data-testid="stSidebar"] p { font-size: 15px !important; color: #333333 !important; }
+    [data-testid="stSidebarCollapsedControl"] {
+        display: block !important; color: black !important;
+        background-color: rgba(200, 200, 200, 0.4) !important; 
+        border-radius: 0 8px 8px 0; z-index: 999999;
+    }
+    .mode-box {
+        background-color: #E6F2FF; border: 1px solid #CCE5FF; color: #0056b3;
+        padding: 12px; border-radius: 6px; margin-bottom: 12px;
+        font-weight: bold; display: flex; align-items: center; gap: 8px;
+    }
+    .support-btn {
+        width: 100%; background-color: white; border: 1px solid #dddddd;
+        border-radius: 20px; padding: 10px 0; color: #0066cc;
+        text-align: center; font-weight: bold; margin-top: 40px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05); cursor: default;
+    }
+    .license-card {
+        background-color: #ffffff; padding: 40px; border-radius: 10px;
+        border: 1px solid #e0e0e0; box-shadow: 0 8px 16px rgba(0,0,0,0.1);
+        text-align: center; max-width: 650px; margin: 40px auto;
+    }
+    .mid-box {
+        background-color: #f8f9fa; padding: 15px; border: 1px dashed #6c757d;
+        border-radius: 5px; font-family: monospace; font-size: 1.2em;
+        color: #d63384; margin: 20px 0; word-break: break-all;
+    }
+    /* 美化原生按鈕區域 */
+    .upload-area {
+        border: 1px solid #ddd; padding: 20px; border-radius: 8px;
+        background-color: #fafafa; text-align: center; margin-bottom: 20px;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# 3. 模組載入
+# ==============================================================================
+try:
+    from utils.paths import get_resource_path, get_writable_path
+    from utils.localization import t
+    from services.security import verify_license_tier, get_fingerprint_for_ui
+    from database.db_manager import init_db, login_user
+    from services.auth_service import validate_session, logout_user
+    from services.plans import get_plan_config
+    
+    from ui.login_view import render_login
+    from ui.portal_view import render_portal
+    from ui.dashboard_view import render_dashboard
+    from ui.exam_gen_view import render_exam_generator
+    from ui.history_view import render_history
+    from ui.settings_view import render_settings
+    from ui.admin_view import render_admin
+    from ui.my_exams_view import render_my_exams_view
+    from ui.question_bank_view import render_question_bank
+    
+    from utils.styles import apply_mac_style
+    import matplotlib.pyplot as plt
+except ImportError as e:
+    st.error(f"❌ Startup Error: {e}")
+    st.stop()
+
+LICENSE_PATH = get_writable_path("license.key")
+LOGO_PATH = get_writable_path("logo.png")
+
+# ==============================================================================
+# 4. OS-Level File Dialog (The Only Way)
+# ==============================================================================
+def get_native_file(file_extensions=None, prompt="Select File"):
+    """
+    呼叫作業系統原生對話框。
+    Mac: 使用 AppleScript (osascript)
+    Win: 使用 Tkinter
+    """
+    system = platform.system()
+    
+    # --- macOS (AppleScript) ---
+    if system == "Darwin":
+        try:
+            type_str = ""
+            if file_extensions:
+                # AppleScript 語法: {"key", "txt"}
+                ext_list = ', '.join([f'"{ext}"' for ext in file_extensions])
+                type_str = f'of type {{{ext_list}}}'
+            
+            # 使用 System Events 確保視窗跳到最前
+            script = f'''
+            tell application "System Events"
+                activate
+                set f to choose file with prompt "{prompt}" {type_str}
+                return POSIX path of f
+            end tell
+            '''
+            
+            cmd = ['osascript', '-e', script]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            if result.returncode == 0:
+                path = result.stdout.decode('utf-8').strip()
+                if path: return [path] 
+            return None
+        except Exception as e:
+            st.error(f"System Dialog Error: {e}")
+            return None
+
+    # --- Windows / Linux (Tkinter) ---
+    else:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            
+            root = tk.Tk()
+            root.withdraw() 
+            root.wm_attributes('-topmost', 1)
+            
+            filetypes = []
+            if file_extensions:
+                ext_str = " ".join([f"*.{ext}" for ext in file_extensions])
+                filetypes.append(("Allowed Files", ext_str))
+            filetypes.append(("All Files", "*.*"))
+            
+            file_path = filedialog.askopenfilename(title=prompt, filetypes=filetypes)
+            root.destroy()
+            
+            if file_path: return [file_path]
+            return None
+        except Exception as e:
+            st.error(f"Tkinter Error: {e}")
+            return None
+
+# ==============================================================================
+# 5. 授權與初始化頁面 (Native Only)
+# ==============================================================================
+def render_license_setup(message=""):
+    st.markdown(f"""
+        <div class="license-card">
+            <h2>🔐 系統授權設定 (System Activation)</h2>
+            <p style="color: #666;">{message if message else '請完成授權以啟動系統。'}</p>
+            <div class="mid-box">{get_fingerprint_for_ui()}</div>
+            <p><small>☝️ 請複製上方機器碼 (Machine ID) 提供給<b>軟體客服人員</b>。</small></p>
+        </div>
+    """, unsafe_allow_html=True)
+
+    c1, c2 = st.columns([1, 1])
+    
+    # --- License Upload ---
+    with c1:
+        st.markdown('<div class="upload-area">', unsafe_allow_html=True)
+        st.subheader("📂 授權檔案")
+        st.caption("必要檔案 (license.key)")
+        
+        if st.button("開啟系統視窗選取 License", key="btn_lic_native", type="primary", use_container_width=True):
+            files = get_native_file(file_extensions=["key"], prompt="請選擇 license.key 檔案")
+            if files and len(files) > 0:
+                try:
+                    shutil.copy(files[0], LICENSE_PATH)
+                    st.toast("✅ License 已匯入！", icon="🎉")
+                    time.sleep(1.5)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"匯入失敗: {e}")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # --- Logo Upload ---
+    with c2:
+        st.markdown('<div class="upload-area">', unsafe_allow_html=True)
+        st.subheader("🖼️ 品牌 Logo")
+        st.caption("選填 (logo.png/jpg)")
+        
+        if st.button("開啟系統視窗選取 Logo", key="btn_logo_native", use_container_width=True):
+            files = get_native_file(file_extensions=["png", "jpg", "jpeg"], prompt="請選擇 Logo 圖片")
+            if files and len(files) > 0:
+                try:
+                    shutil.copy(files[0], LOGO_PATH)
+                    st.toast("✅ Logo 已匯入！", icon="🖼️")
+                    time.sleep(1.5)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"匯入失敗: {e}")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+def check_license_gatekeeper():
+    if not os.path.exists(LICENSE_PATH): 
+        return False, "License file not found."
+    try:
+        is_valid, message, plan, title = verify_license_tier(LICENSE_PATH)
+        if not is_valid: return False, message
+        
+        st.session_state["SYSTEM_PLAN"] = plan
+        st.session_state["APP_TITLE"] = title
+        if "license_data" not in st.session_state:
+            st.session_state["license_data"] = {"features": []} 
+        return True, "OK"
+    except Exception as e:
+        return False, f"Check Error: {str(e)}"
+
+load_dotenv()
+init_db()
+
+# ==============================================================================
+# 6. 主應用程式邏輯
+# ==============================================================================
+def main_app():
+    # A. 授權檢查
+    is_valid, msg = check_license_gatekeeper()
+    
+    if not is_valid:
+        render_license_setup(msg)
+        st.stop()
+
+    # B. 登入檢查
+    if "is_authenticated" not in st.session_state:
+        st.session_state.update({"is_authenticated": False, "lang": "zh_tw"})
+    
+    if not st.session_state["is_authenticated"]:
+        render_login(); return
+
+    user = st.session_state["user"]
+    user.plan = st.session_state.get("SYSTEM_PLAN", "free")
+
+    if "app_mode" not in st.session_state:
+        render_portal(user); return
+
+    app_mode = st.session_state.app_mode
+
+    # C. Sidebar
+    with st.sidebar:
+        st.subheader(f"Hi, {user.real_name or user.username}")
+        st.caption("Language / Langue")
+        st.selectbox("Lang", ["🇹🇼 繁體中文", "🇺🇸 English"], key="lang_sel", label_visibility="collapsed")
+        st.write("") 
+
+        mode_icon = "📝" if app_mode == "creator" else "📈"
+        mode_text = "出卷中心" if app_mode == "creator" else "閱卷中心"
+        st.markdown(f'<div class="mode-box">{mode_icon} Mode: {mode_text}</div>', unsafe_allow_html=True)
+        
+        if st.button("🏠 切換工作模式", use_container_width=True, type="primary"):
+            del st.session_state.app_mode
+            if "page_selection" in st.session_state: del st.session_state.page_selection
+            st.rerun()
+
+        st.markdown("---")
+        st.caption("試卷設計與管理")
+        
+        # Menu Definition
+        if app_mode == "creator":
+            menu_structure = [
+                ("menu_exam_gen", "試卷生成", render_exam_generator),
+                ("menu_my_exams", "我的試卷庫", render_my_exams_view),
+                ("menu_bank", "題庫中心", render_question_bank),
+                ("menu_settings", "個人設定", render_settings),
+            ]
+            plan_config = get_plan_config(user.plan, st.session_state.get("license_data", {}).get("features", []))
+            if getattr(user, "is_admin", False) and plan_config.get("show_admin", False):
+                menu_structure.append(("menu_admin", "系統管理", render_admin))
+        else:
+            menu_structure = [
+                ("menu_grading", "閱卷儀表板", render_dashboard),
+                ("menu_history", "歷史紀錄", render_history),
+                ("menu_settings", "個人設定", render_settings),
+            ]
+
+        # Routing Logic
+        raw_labels = [m[1] for m in menu_structure]
+        requested_page_key = st.session_state.get("page_selection") 
+        target_label = None
+        if requested_page_key:
+            for item in menu_structure:
+                if item[0] == requested_page_key: target_label = item[1]; break
+        
+        current_selection = st.session_state.get("page_selection_clean", raw_labels[0])
+        if target_label and target_label in raw_labels:
+            current_selection = target_label
+            st.session_state.page_selection = None
+            st.session_state.page_selection_clean = current_selection
+
+        if current_selection not in raw_labels: current_selection = raw_labels[0]
+            
+        display_labels = [f"🔴 {lbl}" if lbl == current_selection else f"⚪ {lbl}" for lbl in raw_labels]
+        label_map = {d: m for d, m in zip(display_labels, menu_structure)}
+        curr_idx = raw_labels.index(current_selection)
+
+        sel = st.radio("Navigation", display_labels, index=curr_idx, label_visibility="collapsed", key="nav_radio")
+        
+        selected_item = label_map[sel]
+        clean_label = selected_item[1]
+        target_func = selected_item[2]
+
+        if st.session_state.get("page_selection_clean") != clean_label:
+            st.session_state.page_selection_clean = clean_label
+            st.rerun()
+
+        st.markdown("---")
+        if st.button("登出", use_container_width=True, type="secondary"):
+            logout_user(); st.rerun()
+
+        st.markdown(f'<div class="support-btn">✨ Support Mathematics</div>', unsafe_allow_html=True)
+
+    if target_func: target_func(user)
+    else: st.error(f"View not found")
+
+#if __name__ == "__main__":
+#    main_app()

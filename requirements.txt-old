@@ -1,0 +1,52 @@
+# requirements.txt
+# --- 2026.01.04 Windows/EXE 生產環境校準版 ---
+
+# 核心 AI 服務
+google-genai>=1.56.0
+openai>=1.75.0
+
+# 網頁 UI 核心
+streamlit>=1.52.2
+extra-streamlit-components>=0.1.81
+streamlit-option-menu>=0.4.0
+
+# 數據與數學
+numpy>=1.26.0
+pandas>=2.2.0
+sympy>=1.13.0
+scipy>=1.14.0
+
+# 影像處理 & PDF (關鍵修正)
+opencv-python-headless>=4.10.0.84
+Pillow>=10.3.0
+pymupdf>=1.24.0
+pytesseract>=0.3.13
+qrcode[pil]>=8.0.0
+
+# 文件與報表
+pypdf>=5.0.0
+reportlab>=4.2.0
+XlsxWriter>=3.2.0
+
+# 安全性與後端資料庫
+sqlalchemy>=2.0.30
+bcrypt>=4.1.0
+python-dotenv>=1.0.1
+pytz
+
+# 資料庫驅動
+psycopg2-binary>=2.9.9
+
+# 數據可視化
+matplotlib>=3.9.0
+seaborn>=0.13.0
+plotly>=5.22.0
+
+# 範本引擎
+jinja2>=3.1.4
+
+# 打包工具
+pyinstaller>=6.9.0
+Cython
+setuptools
+wheel

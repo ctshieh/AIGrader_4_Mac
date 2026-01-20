@@ -60,8 +60,9 @@ jobs:
           --add-data "services:services" \
           --add-data "database:database" \
           --add-data "utils:utils" \
+          --add-data "app.py:." \
           --add-data ".env:." \
-          run.py
+          run_native.py
 
     # 6. 製作 .dmg 安裝檔 (Drag-and-Drop Installer)
     # 這步會把 dist/MathGraderPro.app 包裝成 MathGraderPro_Installer.dmg

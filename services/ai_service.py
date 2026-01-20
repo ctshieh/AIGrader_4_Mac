@@ -1,20 +1,145 @@
 # services/ai_service.py
 # -*- coding: utf-8 -*-
-# Module-Version: v2026.01.01-AI-Math-Enhanced
-# Description: 
-# 1. [Prompt Fix] Enforces strict LaTeX ($...$) formatting in generated JSON Rubrics.
-# 2. [Prompt Fix] Enhanced Mathematics Guidelines for granular partial credit and ECF.
-import sympy
-import os
-import json
 import logging
-import time
+import json
 import re
 from google import genai
 from google.genai import types
+from services.rubric_service import RubricService # [CRITICAL] 必須引用
 
 logger = logging.getLogger(__name__)
 
+
+######
+def generate_rubric(pdf_path: str, model_name: str, api_key: str, subject: str, language: str, granularity: str = "標準") -> dict:
+    """
+    [FIXED] 
+    1. 支援 granularity 參數，避免 dashboard_view 報錯。
+    2. 呼叫 RubricService，確保「定積分」與「Description」規則生效。
+    3. 自動封裝 JSON 格式。
+    """
+    try:
+        # 1. 驗證 API Key
+        if not api_key: raise ValueError("Missing API Key")
+        client = genai.Client(api_key=api_key)
+        
+        # 2. [關鍵] 從 RubricService 取得最新的 Prompt (包含積分規則)
+        system_instr = RubricService.get_rubric_generation_prompt(
+            subject_key=subject, 
+            granularity=granularity, 
+            language=language
+        )
+        
+        # 3. 讀取檔案
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        # 4. 發送請求
+        # [提示] 我們在 user prompt 裡再次強調 JSON 格式，雙重保險
+        user_prompt = "Generate the grading rubric JSON. Ensure 'description' fields are filled and LaTeX math is correct."
+        
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[
+                types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+                user_prompt
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=system_instr,
+                response_mime_type="application/json"
+            )
+        )
+
+        # 5. 解析回傳資料 (雙重解析機制)
+        final_data = None
+        if response.parsed:
+            final_data = response.parsed
+        else:
+            # 手動清洗 Markdown
+            raw_text = response.text
+            cleaned_text = re.sub(r"```json\s*", "", raw_text, flags=re.IGNORECASE)
+            cleaned_text = re.sub(r"```\s*$", "", cleaned_text, flags=re.IGNORECASE).strip()
+            try:
+                final_data = json.loads(cleaned_text)
+            except:
+                pass
+
+        # 6. 結構封裝 (防止前端因為 List 報錯)
+        if isinstance(final_data, list):
+            final_data = {"questions": final_data}
+            
+        return final_data
+
+    except Exception as e:
+        logger.error(f"Rubric Gen Error: {e}")
+        return None
+
+
+######
+
+
+# [FIX] 這裡加上 granularity 的預設值，防止舊代碼呼叫時報錯
+def generate_rubric1(pdf_path, model_name, api_key, subject, language, granularity="標準"):
+    """
+    產生評分標準 JSON。
+    """
+    try:
+        client = genai.Client(api_key=api_key)
+        
+        # 1. 呼叫 RubricService (確保 logic 變數正確)
+        system_instr = RubricService.get_rubric_generation_prompt(
+            subject_key=subject, 
+            granularity=granularity, 
+            language=language
+        )
+        
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        print(f"🚀 [AI Service] Generating Rubric for {subject}...")
+
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[
+                types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+                "Please design the grading rubric JSON based on the exam."
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=system_instr,
+                response_mime_type="application/json"
+            )
+        )
+
+        # 2. 雙重解析機制 (SDK -> Manual)
+        final_data = None
+        if response.parsed:
+            final_data = response.parsed
+        else:
+            # 手動清洗 Markdown
+            raw_text = response.text
+            # [FIX] 使用 raw string 避免 SyntaxWarning
+            cleaned_text = re.sub(r"```json\s*", "", raw_text, flags=re.IGNORECASE)
+            cleaned_text = re.sub(r"```\s*$", "", cleaned_text, flags=re.IGNORECASE)
+            cleaned_text = cleaned_text.strip()
+            try:
+                final_data = json.loads(cleaned_text)
+            except json.JSONDecodeError:
+                print(f"❌ JSON Decode Error. Raw: {cleaned_text[:100]}")
+                return None
+
+        # 3. [CRITICAL] 結構封裝：確保回傳的是 Dict 且包含 "questions"
+        # 這是為了解決 dashboard_view.py 報錯的問題
+        if isinstance(final_data, list):
+            print("🔧 Detected List format. Wrapping in {'questions': ...}")
+            final_data = {"questions": final_data}
+        
+        return final_data
+
+    except Exception as e:
+        logger.error(f"Rubric Gen Error: {str(e)}")
+        return None
+
+#####
 def _get_valid_api_key(user_key: str) -> str:
     if user_key and user_key.strip(): return user_key
     raise ValueError("BYOK_REQUIRED: Missing API Key. Please configure your Gemini API Key in Settings.")
@@ -137,228 +262,70 @@ def _infer_sympy_checks(rubric_json: dict, subject: str = "Mathematics") -> dict
         logger.error(f"Infer SymPy checks error: {e}")
         return rubric_json
 
+######
 
-def generate_rubric(pdf_path: str, model_name: str, api_key: str, subject: str = "Mathematics", language: str = "Traditional Chinese") -> str:
+# --- Main Function ---
+
+def generate_rubric(pdf_path, model_name, api_key, subject, language, granularity="標準"):
     """
-    產生評分標準 - 包含完整的 STEM 分段給分邏輯、數學等價性與 1-1 子題格式
-    [Updated] Enhanced Math guidelines for granular scoring.
+    產生評分標準 JSON。
+    [RESTORED] 整合 RubricService 的 Prompt 與舊版的後處理邏輯。
     """
     try:
-        real_key = _get_valid_api_key(api_key)
-        client = genai.Client(api_key=real_key)
+        client = genai.Client(api_key=api_key)
         
-        with open(pdf_path, "rb") as f:
-             file_ref = client.files.upload(
-                 file=f, 
-                 config={'display_name': 'Rubric_Source', 'mime_type': 'application/pdf'}
-             )
-        time.sleep(2) 
-
-        # ======================================================================
-        # Domain-Based Strict Guidelines (領域規則) - [ENHANCED]
-        # ======================================================================
-        SUBJECT_GUIDELINES = {
-            "Mathematics": """
-            **STRICT MATHEMATICS / LINEAR ALGEBRA / STATISTICS RUBRIC GUIDELINES (University-level, STRICT):**
-
-            1) **Adaptive Granularity (DO NOT be overly coarse or overly verbose)**:
-               - Choose the number of rubric steps PER sub-question using BOTH point-value and complexity:
-                 * ≤ 5 points: 2–3 steps
-                 * 6–10 points: 3–5 steps
-                 * 11–15 points: 5–7 steps
-                 * 16–20 points: 6–8 steps
-                 * > 20 points: 8–12 steps
-               - Complexity adjustment:
-                 * Single-line computation (e.g., det of 2x2, mean of small dataset): use the LOWER bound.
-                 * One major transformation (e.g., one L'Hôpital / one RREF / one t-test): use the MIDDLE range.
-                 * Multi-stage reasoning (multiple transformations or multi-part derivations): use the UPPER bound.
-
-            2) **Strict Computation Policy (University grading)**:
-               - For any step that involves calculation/derivation/simplification/substitution:
-                 * If the key computation is WRONG, award **0** for that step.
-                 * At most **1 point** may be awarded as "method recognition" ONLY when the method/setup is clearly correct.
-               - A correct final answer with no supporting work gets **0** unless the problem explicitly states "answer-only allowed".
-
-            3) **ECF (Error Carried Forward) DEFAULT = OFF**:
-               - Only allow ECF when explicitly written in the criterion: "允許錯誤帶入(ECF)".
-               - Even when ECF is allowed, NEVER award points for incorrect computations; ECF applies only to later logical steps using the student's previous result.
-
-            4) **Criterion must be CHECKABLE (MANDATORY)**:
-               - Each rubric item MUST be short and written in {language}.
-               - Each rubric item MUST follow this template (single paragraph, no line breaks):
-                 "（動作/要求）。需出現：<可檢核要素列表>。"
-                 Optionally add: "若<常見錯誤>→此步0分。" or "允許錯誤帶入(ECF)。"
-               - Avoid fancy Unicode math glyphs; keep plain text + LaTeX ($...$) only.
-
-            5) **Statistics-specific notes**:
-               - If an answer is numerical, specify acceptable rounding (e.g., to 3 decimals) and tolerance (e.g., ±0.001) in the criterion when appropriate.
-               - Require both computation AND correct conclusion (reject / fail to reject H0) when applicable.
-
-            6) **Linear Algebra-specific notes**:
-               - Prefer checkable intermediate results (e.g., RREF, pivot columns, det, eigenpairs).
-
-            7) **SymPy / SciPy Check Metadata (HIGHLY RECOMMENDED, and MANDATORY when applicable)**:
-               - For each rubric item that involves a verifiable computation, include a `check` object.
-               - `check.engine` should be one of: "sympy" (algebra/calculus/linear algebra) or "scipy" (statistics).
-               - Keep expressions SymPy-friendly: use `log(x)` for ln, `exp(x)` for $e^x$, `sin(x)`, `csc(x)`, `cot(x)`.
-               - Example (derivative step): check={engine:"sympy", type:"derivative", var:"x", expr:"csc(x)", expected:"-csc(x)*cot(x)"}.
-
-               - Require explicit key objects: matrix, augmented matrix, row operations, RREF, pivot columns, solution set, eigenpairs, etc.
-               - If a step claims a result (e.g., "RREF is ..."), it must be correct to receive points.
-            """,
-            
-            "Physics": """
-            **STRICT PHYSICS RUBRIC:**
-            1. **FBD**: Missing Free Body Diagram (FBD) = Deduction.
-            2. **Units**: Answer without SI units = 0 points for the answer portion.
-            3. **Variables**: Points for starting with symbolic variables before plugging in numbers.
-            """,
-            
-            "Chemistry": """
-            **STRICT CHEMISTRY RUBRIC:**
-            1. **Stoichiometry**: Unbalanced equations = 0 points.
-            2. **States of Matter**: Missing (s), (l), (g), (aq) where crucial = Deduction.
-            3. **Sig Figs**: Answers must respect significant figures (if applicable).
-            """,
-            
-            "Coding": """
-            **STRICT CODING RUBRIC:**
-            1. **Edge Cases**: Must handle boundary inputs (null, empty list, negative numbers).
-            2. **Complexity**: Inefficient algorithms ($O(n^2)$ when $O(n)$ exists) = Partial credit.
-            3. **Style**: Variable naming and indentation checks.
-            """,
-            
-            "Essay": """
-            **STRICT ESSAY RUBRIC:**
-            1. **Thesis**: Must have a clear thesis statement.
-            2. **Evidence**: Claims must be supported by specific examples.
-            3. **Structure**: Logical flow and paragraph transitions.
-            """
-        }
-
-        subject_focus = SUBJECT_GUIDELINES.get(subject, SUBJECT_GUIDELINES.get("Math", SUBJECT_GUIDELINES["Mathematics"]))
-
-        # [PROMPT UPDATE] Added Section 7 for LaTeX Formatting
-        prompt = ("""
-        Act as a **Distinguished University Professor in {subject}**. Create a rigorous Answer Key and Grading Rubric.
-
-        ### OBJECTIVE
-        Analyze the **ATTACHED PDF EXAM** and generate a JSON rubric.
-
-        ### DOMAIN FOCUS & STRICT RULES
-        {subject_focus}
-
-        ### INSTRUCTIONS (STRICT STEP-BY-STEP SCORING)
-
-        1. **SOLVE** the problems in the PDF step-by-step clearly to derive the Ground Truth. All University level derivation and computation cannot be ommitted.
-
-        2. **BREAK DOWN** scoring into granular partial credit steps (Adaptive step count per sub-question using the Guideline's table) (Follow the Domain Guidelines above):
-           - **Concept**: Understanding the underlying principle.
-           - **Setup**: Equations/diagrams/formulas setup.
-           - **Execution**: Mathematical manipulation/Calculus steps.
-           - **Answer**: Final result.
-
-        3. **Step-by-Step Verification (Carry Forward Error)**:
-           - Explicitly mark in the `description` or `criteria` that ECF is allowed for logical steps derived from previous errors.
-        
-        4. **Zero Tolerance for Magic Answers**:
-           - If a complex problem has a correct final answer but no supporting work, the score is 0.
-
-        5. **SUB-QUESTIONS (CRITICAL FORMAT)**: 
-           - You MUST use the format **"1-1", "1-2"** (NOT "1a", "1b").
-           - Example: If Question 1 has parts (a) and (b), their IDs must be "1-1" and "1-2".
-
-        6. **FORMAT**: Output strict JSON.
-
-        6.1 **RUBRIC STEP IDENTIFIERS (RECOMMENDED)**:
-           - For each rubric item, include `rule_id` (e.g., "1-3.S2") and a short `title`.
-           - Keep backward compatibility: still include `points` and `criterion`.
-
-
-        6.2 **CHECK METADATA (MANDATORY when the step is computational and checkable)**:
-           - For each rubric item that can be mechanically verified, include a `check` object.
-           - Use SymPy-friendly expressions (ASCII): log(x), exp(x), sin(x), cos(x), tan(x), csc(x), sec(x), cot(x).
-           - Typical `check` types:
-             * derivative: {{"engine":"sympy","type":"derivative","var":"x","expr":"csc(x)","expected":"-csc(x)*cot(x)","policy":{{"all_or_nothing":true,"partial_credit_max":1}}}}
-             * matrix_rref: {{"engine":"sympy","type":"matrix_rref","var":"x","input":{{"A":"[[1,2],[3,4]]"}},"expected":{{"rref":"[[1,0], [0,1]]"}}}}
-             * det: {{"engine":"sympy","type":"det","input":{{"A":"[[1,2],[3,4]]"}},"expected":{{"value":"-2"}}}}
-             * ttest_pvalue: {{"engine":"scipy","type":"ttest_pvalue","input":{{"xbar":12.3,"s":2.1,"n":25,"mu0":12,"alternative":"two-sided"}},"expected":{{"pvalue":0.43,"tol":0.001}}}
-           - If a step is purely conceptual and not mechanically checkable, you MAY omit `check`.
-
-
-           - For each rubric item, include `rule_id` (e.g., "1-3.S2") and a short `title`.
-           - Keep backward compatibility: still include `points` and `criterion`.
-
-        6.3 **CALCULUS CHECK RULES (CRITICAL)**:
-           - For **Intermediate Limits** (e.g., L'Hopital result, Simplification):
-             The `expected` MUST be the algebraic expression, NOT the final number.
-             * Example: If limit is -x -> 0.
-             * Step "Simplification": expected="-x" (Check algebra).
-             * Step "Final Answer": expected="0" (Check value).
-             
-           - For **L'Hopital's Rule**:
-             The `expected` MUST be the fraction of derivatives.
-             * correct: "(1/x)/(-1/x**2)" or simplified "-x".
-             * INCORRECT: "1/x" (Numerator only) -> This causes grading errors.
-
-        7. **[LATEX FORMATTING - MANDATORY]**:
-           - **ALL mathematical expressions MUST be wrapped in LaTeX delimiters ($...$).**
-           - **Correct**: "The integral is $\\int x^2 dx$."
-           - **Incorrect**: "The integral is \int x^2 dx" or "The integral is x^2".
-           - This applies to `description`, `criteria`, and any text field in the JSON.
-
-        ### OUTPUT LANGUAGE
-        **STRICTLY OUTPUT THE CONTENT IN {language}.**
-
-        ### OUTPUT JSON SCHEMA (STRICT FOLLOW)
-        {{
-          "exam_title": "Exam Name",
-          "total_points": 100,
-          "questions": [
-            {{
-              "id": "1",
-              "points": 15,
-              "description": "Calculate the limit: $\\lim_{{x \\to 0}} \\frac{{\\sin x}}{{x}}$...",
-              "sub_questions": [
-                {{
-                    "id": "1-1", 
-                    "points": 5, 
-                    "description": "Evaluate limit",
-                    "rubric": [
-                        {{ "rule_id":"1-1.S1","title":"方法辨識","points": 2, "criterion": "正確辨識方法。需出現：$...$。", "check": {{"engine":"sympy","type":"derivative","var":"x","expr":"log(x)","expected":"1/x","policy":{{"all_or_nothing":true,"partial_credit_max":1}}}} }},
-                        {{ "points": 2, "criterion": "Derivative calculation: $\\cos x$" }},
-                        {{ "points": 1, "criterion": " $1$" }}
-                    ]
-                }}
-              ]
-            }}
-          ]
-        }}
-        """).replace("{language}", language)      
-        
-        target_model = model_name if "pro" in model_name else "gemini-2.5-pro"
-        
-        resp = client.models.generate_content(
-            model=target_model, 
-            contents=[types.Content(role="user", parts=[
-                types.Part.from_uri(file_uri=file_ref.uri, mime_type=file_ref.mime_type),
-                types.Part.from_text(text=prompt)
-            ])]
+        # 1. 取得完整 Prompt (包含舊版詳細 Schema)
+        system_instr = RubricService.get_rubric_generation_prompt(
+            subject_key=subject, 
+            granularity=granularity, 
+            language=language
         )
         
-        clean_text = _clean_json_response(resp.text)
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        # 2. 發送請求
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[
+                types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+                "Please generate the rubric following the JSON schema strictly."
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=system_instr,
+                response_mime_type="application/json"
+            )
+        )
+
+        # 3. [CRITICAL] 執行完整的後處理流程 (Restore Pipeline)
+        clean_text = _clean_json_response(response.text)
+        
         try:
             rubric_json = json.loads(clean_text)
+            
+            # (A) 修正分數加總
             rubric_json = _validate_and_fix_math(rubric_json)
+            
+            # (B) 推斷 SymPy 檢查 (如果 AI 漏掉)
             rubric_json = _infer_sympy_checks(rubric_json, subject=subject)
-            return json.dumps(rubric_json, ensure_ascii=False, indent=2)
+            
+            # (C) 確保回傳格式正確 (Dict wrapper)
+            if isinstance(rubric_json, list):
+                rubric_json = {"questions": rubric_json}
+                
+            return rubric_json # 直接回傳 Dict，讓 UI 轉 JSON string
+            
         except json.JSONDecodeError as je:
-            logger.error(f"JSON Parse Error. Raw text: {resp.text[:500]}...") 
-            return ""
+            logger.error(f"JSON Parse Error. Raw: {clean_text[:100]}...")
+            return None
 
     except Exception as e:
-        logger.error(f"Rubric Gen Error: {e}")
-        return "" 
+        logger.error(f"Rubric Gen Error: {str(e)}")
+        return None
+
+
+
+#####
 
 def generate_class_analysis(grading_results, rubric_text, api_key, report_mode="simple", language="Traditional Chinese") -> str:
     """
@@ -424,4 +391,5 @@ def generate_class_analysis(grading_results, rubric_text, api_key, report_mode="
     except Exception as e:
         logger.error(f"Class Analysis Gen Error: {e}")
         return f"Analysis Failed: {e}"
+
 

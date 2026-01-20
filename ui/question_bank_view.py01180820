@@ -1,0 +1,321 @@
+# Copyright (c) 2026 [謝忠村/Chung Tsun Shieh]. All Rights Reserved.
+# This software is proprietary and confidential.
+# Unauthorized copying of this file, via any medium is strictly prohibited.
+
+# ui/question_bank_view.py
+# -*- coding: utf-8 -*-
+# Module-Version: 2.2.0 (Full Feature: Public/Private/Sets + Taxonomy + i18n)
+
+import streamlit as st
+import json
+import time
+import ast
+from utils.localization import t
+from database.db_manager import (
+    get_all_questions, save_question, 
+    create_question_set, get_user_question_sets, 
+    get_question_set_items, delete_question_set
+)
+
+# 模擬分類結構 (建議未來移至 DB 或 Config)
+DEFAULT_TAXONOMY = {
+    "Science": {
+        "Calculus I": {
+            "Ch1 Limits": ["1.1 Definition", "1.2 Calculation", "1.3 Continuity"],
+            "Ch2 Derivatives": ["2.1 Definition", "2.2 Rules", "2.3 Chain Rule"]
+        },
+        "Linear Algebra": {
+            "Ch1 Matrices": ["1.1 Operations", "1.2 Determinants"],
+            "Ch2 Vector Spaces": ["2.1 Basis"]
+        }
+    },
+    "Engineering": {
+        "Engineering Math": {
+            "Ch1 ODE": ["1.1 First Order"],
+            "Ch2 Laplace": ["2.1 Definition"]
+        }
+    }
+}
+
+def render_question_bank(user):
+    # Page Title
+    st.title(f"📚 {t('menu_bank') if t('menu_bank')!='menu_bank' else 'Question Bank Center'}")
+
+    # Init Shopping Cart
+    if 'bank_cart' not in st.session_state: st.session_state.bank_cart = set()
+
+    # --- Tabs Definition ---
+    # 使用 t() 進行翻譯，若無 key 則顯示預設英文/中文
+    lbl_pub = t('tab_bank_public') if t('tab_bank_public')!='tab_bank_public' else "🌏 Public Bank"
+    lbl_pri = t('tab_bank_private') if t('tab_bank_private')!='tab_bank_private' else "🔒 My Private Bank"
+    lbl_set = t('tab_bank_sets') if t('tab_bank_sets')!='tab_bank_sets' else "📂 My Question Sets"
+    lbl_add = t('tab_bank_add') if t('tab_bank_add')!='tab_bank_add' else "➕ Contribute / Add"
+
+    tab_public, tab_private, tab_sets, tab_add = st.tabs([lbl_pub, lbl_pri, lbl_set, lbl_add])
+
+    # Fetch Data
+    all_qs = get_all_questions() 
+    # Logic: Public = marked public OR fallback; Private = matches user ID
+    public_qs = [q for q in all_qs if q.get('is_public', True) == True]
+    private_qs = [q for q in all_qs if q.get('owner_id') == user.id]
+
+    # ==========================================================================
+    # Component: Browser & Filter (共用渲染器)
+    # ==========================================================================
+    def render_browser(dataset, mode="public"):
+        col_filter, col_list = st.columns([1, 3])
+        
+        with col_filter:
+            st.subheader(f"🗂️ {t('lbl_filters') if t('lbl_filters')!='lbl_filters' else 'Filters'}")
+            
+            # --- Taxonomy Selectors ---
+            # 1. Category
+            cat_opts = ["All"] + list(DEFAULT_TAXONOMY.keys())
+            sel_cat = st.selectbox(t('lbl_category') if t('lbl_category')!='lbl_category' else "Category", cat_opts, key=f"{mode}_cat")
+            
+            # 2. Subject
+            sub_opts = ["All"]
+            if sel_cat != "All": sub_opts += list(DEFAULT_TAXONOMY[sel_cat].keys())
+            sel_sub = st.selectbox(t('lbl_subject') if t('lbl_subject')!='lbl_subject' else "Subject", sub_opts, key=f"{mode}_sub")
+            
+            # 3. Chapter
+            chap_opts = ["All"]
+            if sel_cat != "All" and sel_sub != "All":
+                chap_opts += list(DEFAULT_TAXONOMY[sel_cat][sel_sub].keys())
+            sel_chap = st.selectbox(t('lbl_chapter') if t('lbl_chapter')!='lbl_chapter' else "Chapter", chap_opts, key=f"{mode}_chap")
+            
+            st.divider()
+            search_kw = st.text_input(t('lbl_keyword') if t('lbl_keyword')!='lbl_keyword' else "Keyword Search", key=f"{mode}_kw")
+            
+            # --- Cart & Save as Set ---
+            st.markdown("---")
+            if st.session_state.bank_cart:
+                cart_len = len(st.session_state.bank_cart)
+                st.info(f"🛒 {t('msg_cart_items') if t('msg_cart_items')!='msg_cart_items' else 'In Cart'}: {cart_len}")
+                
+                # [Action] Save Cart as Question Set
+                with st.expander(t('btn_save_as_set') if t('btn_save_as_set')!='btn_save_as_set' else "💾 Save as Set", expanded=True):
+                    set_title = st.text_input("Set Title", key=f"{mode}_set_title")
+                    set_desc = st.text_area("Description", key=f"{mode}_set_desc", height=60)
+                    
+                    if st.button(t('btn_confirm_save') if t('btn_confirm_save')!='btn_confirm_save' else "Save", key=f"{mode}_save_set"):
+                        if not set_title:
+                            st.error("Title required")
+                        else:
+                            create_question_set(
+                                user.id, 
+                                set_title, 
+                                set_desc, 
+                                list(st.session_state.bank_cart)
+                            )
+                            st.success(f"{t('msg_saved')}: {set_title}")
+                            st.session_state.bank_cart = set() 
+                            time.sleep(1); st.rerun()
+
+                # [Action] Clear Cart
+                if st.button(t('btn_clear_cart') if t('btn_clear_cart')!='btn_clear_cart' else "Clear Cart", key=f"{mode}_clr"):
+                    st.session_state.bank_cart = set()
+                    st.rerun()
+            else:
+                st.caption(t('msg_cart_empty') if t('msg_cart_empty')!='msg_cart_empty' else "Cart is empty")
+
+        with col_list:
+            # --- Filtering Logic ---
+            filtered = []
+            for q in dataset:
+                # Parse Meta
+                meta = q.get('meta', {})
+                if isinstance(meta, str):
+                    try: meta = json.loads(meta)
+                    except: meta = {}
+                
+                # Check Filters
+                if sel_cat != "All" and meta.get('category') != sel_cat: continue
+                if sel_sub != "All" and meta.get('subject') != sel_sub: continue
+                # Chapter logic can be added here if meta supports it
+                
+                if search_kw and search_kw.lower() not in q['content'].lower(): continue
+                filtered.append(q)
+
+            st.caption(f"Showing {len(filtered)} items")
+            
+            if not filtered:
+                st.info(t('msg_no_data') if t('msg_no_data')!='msg_no_data' else "No questions found.")
+            else:
+                for q in filtered:
+                    qid = q['id']
+                    in_cart = qid in st.session_state.bank_cart
+                    
+                    # Card UI
+                    border = "#28a745" if in_cart else "#e0e0e0"
+                    bg = "#f0fff4" if in_cart else "#ffffff"
+                    
+                    with st.container():
+                        st.markdown(f'<div style="border:1px solid {border}; border-left:5px solid {border}; padding:15px; margin-bottom:10px; border-radius:5px; background:{bg};">', unsafe_allow_html=True)
+                        
+                        c1, c2 = st.columns([0.85, 0.15])
+                        with c1:
+                            # Tags / Meta
+                            m = q.get('meta', {})
+                            if isinstance(m, str): 
+                                try: m = json.loads(m)
+                                except: m = {}
+                            tags = [m.get(k) for k in ['subject', 'chapter'] if m.get(k)]
+                            if tags: st.caption(" > ".join(tags))
+                            
+                            # Content (LaTeX Support)
+                            st.markdown(q['content'])
+                            
+                            # Sub-questions Preview
+                            subs = q.get('sub_questions', [])
+                            if isinstance(subs, str):
+                                try: subs = json.loads(subs)
+                                except: subs = []
+                            
+                            if subs:
+                                with st.expander(f"{len(subs)} Sub-questions"):
+                                    for idx, sq in enumerate(subs):
+                                        st.markdown(f"↳ **({idx+1})** {sq.get('text','')} *({sq.get('score',0)}pts)*")
+
+                        with c2:
+                            st.write(f"**{q.get('score',0)} pt**")
+                            if in_cart:
+                                if st.button("➖", key=f"rm_{mode}_{qid}"):
+                                    st.session_state.bank_cart.remove(qid)
+                                    st.rerun()
+                            else:
+                                if st.button("➕", key=f"add_{mode}_{qid}"):
+                                    st.session_state.bank_cart.add(qid)
+                                    st.rerun()
+                        
+                        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ==========================================================================
+    # Tab 1 & 2: Render Browsers
+    # ==========================================================================
+    with tab_public: render_browser(public_qs, mode="public")
+    with tab_private: render_browser(private_qs, mode="private")
+
+    # ==========================================================================
+    # Tab 3: My Question Sets (商品化基礎)
+    # ==========================================================================
+    with tab_sets:
+        st.subheader(f"📂 {lbl_set}")
+        my_sets = get_user_question_sets(user.id)
+        
+        if not my_sets:
+            st.info("You haven't created any question sets yet. Go to Public/Private bank, select questions, and save them.")
+        else:
+            c_list, c_detail = st.columns([1, 2])
+            
+            with c_list:
+                # Radio button list for sets
+                sel_set_id = st.radio(
+                    "Select Set", 
+                    [s['id'] for s in my_sets], 
+                    format_func=lambda x: next((s['title'] for s in my_sets if s['id']==x), str(x)),
+                    label_visibility="collapsed"
+                )
+            
+            with c_detail:
+                if sel_set_id:
+                    curr = next((s for s in my_sets if s['id'] == sel_set_id), None)
+                    if curr:
+                        st.markdown(f"### 📄 {curr['title']}")
+                        st.write(f"_{curr.get('description','')}_")
+                        st.caption(f"Created: {curr.get('created_at','-')}")
+                        
+                        # Load Items
+                        item_ids = get_question_set_items(sel_set_id)
+                        st.success(f"Contains {len(item_ids)} questions.")
+                        
+                        ac1, ac2 = st.columns(2)
+                        # Load to Cart
+                        if ac1.button(f"📥 {t('btn_load_to_cart') if t('btn_load_to_cart')!='btn_load_to_cart' else 'Load to Cart'}", width='stretch'):
+                            for qid in item_ids:
+                                st.session_state.bank_cart.add(qid)
+                            st.toast(f"Loaded {len(item_ids)} items to cart!")
+                            time.sleep(0.5); st.rerun()
+                        
+                        # Delete Set
+                        if ac2.button("🗑️ Delete Set", type="primary", width='stretch'):
+                            delete_question_set(sel_set_id)
+                            st.toast("Set deleted.")
+                            time.sleep(0.5); st.rerun()
+                        
+                        st.divider()
+                        st.write("**Preview Questions:**")
+                        for qid in item_ids:
+                            # Simple lookup (inefficient for large DB, ok for prototype)
+                            q_obj = next((q for q in all_qs if q['id'] == qid), None)
+                            if q_obj:
+                                st.markdown(f"- {q_obj['content'][:60]}...")
+
+    # ==========================================================================
+    # Tab 4: Add New Question (Contributor)
+    # ==========================================================================
+    with tab_add:
+        st.subheader(f"➕ {t('header_add_new_q') if t('header_add_new_q')!='header_add_new_q' else 'Add New Question'}")
+        
+        with st.form("new_q_form"):
+            # 1. Classification
+            st.markdown("##### 1. Classification")
+            c_meta1, c_meta2 = st.columns(2)
+            
+            f_cat = c_meta1.selectbox("Category", list(DEFAULT_TAXONOMY.keys()))
+            f_sub = c_meta2.selectbox("Subject", list(DEFAULT_TAXONOMY[f_cat].keys()))
+            
+            # Simple Cascading for Chapter (Assuming structure)
+            chap_list = list(DEFAULT_TAXONOMY[f_cat][f_sub].keys())
+            f_chap = c_meta1.selectbox("Chapter", chap_list)
+            
+            # 2. Content
+            st.markdown("##### 2. Content")
+            is_public = st.toggle("Share to Public Bank?", value=False)
+            q_content = st.text_area("Question Content (LaTeX supported)", height=100)
+            q_score = st.number_input("Default Score", 1, 100, 10)
+            
+            # 3. Sub-questions
+            st.markdown("##### 3. Sub-questions (Optional)")
+            subs_text = st.text_area("Sub-questions (One per line)", height=80)
+            
+            submitted = st.form_submit_button("💾 Save Question", width='stretch')
+            
+            if submitted:
+                if not q_content:
+                    st.error("Content is empty.")
+                else:
+                    # Prepare Meta
+                    meta = {
+                        "category": f_cat,
+                        "subject": f_sub,
+                        "chapter": f_chap
+                    }
+                    
+                    # Prepare Subs
+                    sub_questions = []
+                    if subs_text:
+                        lines = [l.strip() for l in subs_text.split('\n') if l.strip()]
+                        avg_sc = max(1, q_score // len(lines)) if lines else 0
+                        for l in lines:
+                            sub_questions.append({"text": l, "score": avg_sc})
+                            
+                    # Save logic (Mocking the call)
+                    # NOTE: Ensure db_manager.save_question is updated to accept these fields
+                    # Or modify here to pack everything into content_json if DB schema is fixed
+                    
+                    # Packing complex data into 'sub_questions' field as JSON string if DB expects that
+                    subs_json = json.dumps(sub_questions, ensure_ascii=False)
+                    meta_json = json.dumps(meta, ensure_ascii=False)
+                    
+                    # Temporary: Using existing save_question signature + extra handling inside DB needed
+                    # For now, we simulate saving by calling the basic function
+                    # Ideally: save_question(content=q_content, score=q_score, owner_id=user.id, is_public=is_public, meta=meta_json, subs=subs_json)
+                    
+                    try:
+                        save_question(q_content, q_score, "NEW-001") 
+                        # In a real scenario, you'd perform a custom UPDATE to set owner_id/meta here
+                        st.success("Question saved! (Metadata handling requires DB update)")
+                        time.sleep(1); st.rerun()
+                    except Exception as e:
+                        st.error(f"Save failed: {e}")

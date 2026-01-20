@@ -1,0 +1,160 @@
+# Copyright (c) 2026 [謝忠村/Chung Tsun Shieh]. All Rights Reserved.
+# app.py
+# -*- coding: utf-8 -*-
+# Version: v2026.01.15-Final-Integrated-Portal-Fix
+
+import streamlit as st
+import base64
+import os
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+
+# 1. 核心模組匯入
+from database.db_manager import login_user
+from utils.localization import t, set_language
+import utils.helpers as helpers
+
+# 2. UI 視圖匯入
+from ui.login_view import render_login
+from ui.portal_view import render_portal
+from ui.dashboard_view import render_dashboard
+from ui.settings_view import render_settings
+from ui.history_view import render_history
+from ui.exam_gen_view import render_exam_generator
+
+# ==========================================
+# 第一步：環境優化 - 字體與標點符號預載
+# ==========================================
+def init_font_settings():
+    """針對 Mac M4 優化標點符號位置，優先尋找 cwTeX 或 Noto"""
+    try:
+        # 定義優先順序：cwTeX (置底最強) > Noto (開源首選) > 系統預設
+        pref_fonts = ['cwTeX Q Hei', 'Noto Sans CJK TC', 'PingFang HK', 'Heiti TC']
+        sys_fonts = [f.name for f in fm.fontManager.ttflist]
+        for f in pref_fonts:
+            if f in sys_fonts:
+                plt.rcParams['font.sans-serif'] = [f]
+                break
+        plt.rcParams['axes.unicode_minus'] = False
+    except:
+        pass
+
+init_font_settings()
+
+# ==========================================
+# 第二步：不修改之修改 - PDF 導覽注入
+# ==========================================
+def patched_display_pdf(file_input, height=750):
+    """注入導覽列以解決 Native App PDF 遮蔽問題，支援四國語系"""
+    try:
+        col_back, col_info = st.columns([1, 4])
+        with col_back:
+            if st.button(f"⬅️ {t('btn_back', '返回')}", key="nav_pdf_back", type="primary"):
+                st.session_state.view_pdf_data = None
+                st.rerun()
+        with col_info:
+            st.caption(f"ℹ️ {t('pdf_preview_mode', '預覽模式')}")
+
+        data = file_input.getvalue() if hasattr(file_input, "getvalue") else file_input
+        base64_pdf = base64.b64encode(data).decode('utf-8')
+        
+        pdf_display = f'''
+            <div style="border:2px solid #1A365D; border-radius:12px; overflow:hidden; max-height:{height}px;">
+                <embed src="data:application/pdf;base64,{base64_pdf}" width="100%" height="{height}px" type="application/pdf" />
+            </div>'''
+        st.markdown(pdf_display, unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"PDF Error: {e}")
+
+helpers.display_pdf = patched_display_pdf
+
+# ==========================================
+# 第三步：主程式邏輯
+# ==========================================
+def main():
+    st.set_page_config(page_title="NewEra Tools", page_icon="🎓", layout="wide")
+
+    # A. Session 狀態初始化
+    if "is_authenticated" not in st.session_state:
+        st.session_state["is_authenticated"] = False
+    if "user" not in st.session_state:
+        st.session_state["user"] = None
+    if "lang" not in st.session_state:
+        st.session_state["lang"] = "zh_tw"
+    if "view_pdf_data" not in st.session_state:
+        st.session_state.view_pdf_data = None
+
+    # B. 登入檢查
+    if not st.session_state["is_authenticated"]:
+        render_login()
+        return
+
+    user = st.session_state["user"]
+
+    # C. 重要：Portal 路由邏輯 (解決跳過 Portal 的問題)
+    if "app_mode" not in st.session_state:
+        render_portal(user)
+        return
+
+    # D. 功能模式側邊欄
+    app_mode = st.session_state["app_mode"]
+    
+    with st.sidebar:
+        st.title("NewEra Tools")
+        st.markdown(f"👤 **{user['username'] if isinstance(user, dict) else user.username}**")
+        
+        # 模式切換按鈕
+        if st.button(f"🏠 {t('btn_portal', '返回入口中心')}", use_container_width=True):
+            del st.session_state["app_mode"]
+            st.rerun()
+        
+        st.divider()
+        
+        # 根據模式定義選單
+        if app_mode == "creator":
+            # 出卷模式選單
+            menu_options = {
+                "ExamGen": f"📝 {t('menu_exam_gen', '自動出卷')}",
+                "Settings": f"⚙️ {t('menu_settings', '系統設定')}"
+            }
+        else:
+            # 閱卷模式選單
+            menu_options = {
+                "Grading": f"📝 {t('menu_grading', '自動閱卷')}",
+                "History": f"📊 {t('menu_history', '分析報告')}",
+                "Settings": f"⚙️ {t('menu_settings', '系統設定')}"
+            }
+        
+        choice = st.radio(
+            t("menu_title", "功能導覽"),
+            options=list(menu_options.keys()),
+            format_func=lambda x: menu_options[x]
+        )
+        
+        # 語系切換 (zh_tw, en, ja, fr)
+        st.divider()
+        langs = {"zh_tw": "繁體中文", "en": "English", "ja": "日本語", "fr": "Français"}
+        new_lang = st.selectbox("Language", options=list(langs.keys()), 
+                                format_func=lambda x: langs[x],
+                                index=list(langs.keys()).index(st.session_state.lang))
+        if new_lang != st.session_state.lang:
+            st.session_state.lang = new_lang
+            set_language(new_lang)
+            st.rerun()
+
+        if st.button(t("logout_btn", "登出"), use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
+
+    # E. 頁面分流渲染
+    if choice == "Grading":
+        render_dashboard(user)
+    elif choice == "History":
+        render_history(user)
+    elif choice == "ExamGen":
+        render_exam_generator(user)
+    elif choice == "Settings":
+        render_settings(user)
+
+if __name__ == "__main__":
+    main()

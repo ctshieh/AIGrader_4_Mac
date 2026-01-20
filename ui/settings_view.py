@@ -1,157 +1,130 @@
 # ui/settings_view.py
 # -*- coding: utf-8 -*-
-# Module-Version: 18.0.3 (DRY Architecture: Uses shared LANGUAGE_OPTIONS)
+# Version: 19.9.25 (Nexora Full Engine Sync)
 
 import streamlit as st
-import os
-# [優化] 直接從 localization 引入語言選項，不再重複定義
-from utils.localization import t, set_language, LANGUAGE_OPTIONS
-from database.db_manager import update_user, User
+import time
+from database.db_manager import update_user, hash_password, login_user
+from utils.localization import t
+from services.security import get_fingerprint_for_ui
 
-def render_settings(user: User):
+def render_settings(user):
     """
-    渲染設定頁面
-    1. 一般設定 (語言) - 所有人可見
-    2. 機構品牌設定 (Logo/URL/Running Head) - 僅 Business 用戶可見
-    3. 系統維護 (清除暫存) - 所有人可見
+    Nexora 系統設定頁面：管理 API 金鑰、模型選擇與多語系偏好。
+    確保資料庫寫入與 Session 記憶體 100% 同步。
     """
     
-    st.title(f"⚙️ {t('menu_settings')}")
+    # 安全獲取使用者屬性的內部函數 (相容 Row 物件與字典)
+    def get_user_val(attr, default=""):
+        val = getattr(user, attr, None)
+        if val is None and isinstance(user, dict):
+            val = user.get(attr)
+        return val if val is not None else default
 
-    # =========================================================
-    # 1. 一般設定 (General Settings)
-    # =========================================================
-    with st.expander(f"🌐 {t('settings_general')}", expanded=True):
-        
-        # 取得當前語言代碼 (預設 zh_tw)
-        current_lang_code = st.session_state.get('lang', 'zh_tw')
-        
-        # 防呆：確保 current_lang_code 在選項內，否則預設第一個
-        # (因為 LANGUAGE_OPTIONS 是來自 localization.py 的 Single Source of Truth)
-        lang_keys = list(LANGUAGE_OPTIONS.keys())
-        try:
-            current_index = lang_keys.index(current_lang_code)
-        except ValueError:
-            current_index = 0
-
-        # 語言選擇選單
-        sel_lang_code = st.selectbox(
-            t('lbl_language'), 
-            options=lang_keys, 
-            format_func=lambda x: LANGUAGE_OPTIONS[x], # 直接從共用字典取值顯示
-            index=current_index
-        )
-        
-        # 如果語言改變，寫入 Session 並重新執行
-        if sel_lang_code != current_lang_code:
-            set_language(sel_lang_code)
-            st.rerun()
-
-    # =========================================================
-    # 2. 機構專屬設定 (Branding) - 僅 Business Plan 可見
-    # =========================================================
-    # 嚴格檢查 Session 中的授權方案 (由 app.py 的 Gatekeeper 寫入)
-    current_plan = st.session_state.get("SYSTEM_PLAN", "personal")
+    st.markdown(f"## {t('settings_title', '⚙️ 個人設定')}")
     
-    if current_plan == "business":
-        with st.expander(f"🏢 {t('settings_branding_title')} (Business Only)", expanded=False):
-            st.info(t('settings_branding_hint'))
-            
-            c1, c2 = st.columns([1, 1])
-            
-            # --- Column 1: Logo 上傳 ---
-            with c1:
-                st.subheader("Logo Image")
-                
-                # 確保 assets 資料夾存在 (Windows 相容路徑)
-                base_dir = os.getcwd()
-                assets_dir = os.path.join(base_dir, "assets")
-                if not os.path.exists(assets_dir):
-                    os.makedirs(assets_dir)
-                
-                # 定義全域 Logo 路徑 (覆蓋既有檔案)
-                global_logo_path = os.path.join(assets_dir, "branding_logo.png")
+    # 建立功能頁籤
+    tab_keys, tab_profile, tab_sys = st.tabs([
+        t("keys_header", "🔑 API 引擎配置"),
+        t("settings_profile_header", "👤 個人帳戶"),
+        t("lbl_sys_info", "🖥️ 診斷資訊")
+    ])
 
-                # 顯示目前的 Logo
-                if os.path.exists(global_logo_path):
-                    st.image(global_logo_path, caption=t('current_logo', default="Current Logo"), width=150)
+    # --- TAB 1: API 引擎配置 ---
+    with tab_keys:
+        st.markdown(f"### {t('keys_header')}")
+        st.markdown(f"> 🔗 **{t('boyk_link_text', '獲取金鑰')}**: [Google AI Studio (2026)](https://aistudio.google.com/app/apikey)")
+        
+        with st.form("newera_api_config_form"):
+            # 【關鍵】讀取目前儲存的金鑰，解決存完變空白的問題
+            current_google_key = get_user_val("google_key")
+            new_key = st.text_input(
+                t("google_key", "Google Gemini API Key"), 
+                value=current_google_key, 
+                type="password",
+                help="請貼入以 AIza 開頭的金鑰"
+            )
+            
+            # 鎖定 2026 年旗艦模型：Gemini 2.5 系列
+            model_options = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-8b"]
+            current_model = get_user_val("model_name", "gemini-2.5-pro")
+            
+            # 防呆：如果資料庫裡的模型名不在選單內，預設選第一個
+            default_index = 0
+            if current_model in model_options:
+                default_index = model_options.index(current_model)
                 
-                # 檔案上傳器
-                uploaded_logo = st.file_uploader(t('lbl_upload_logo'), type=['png', 'jpg', 'jpeg'])
-                
-                if uploaded_logo:
-                    # 1. 寫入實體檔案 (供 Login/Sidebar 讀取)
-                    with open(global_logo_path, "wb") as f:
-                        f.write(uploaded_logo.getbuffer())
+            new_model = st.selectbox(
+                t("lbl_model", "預設 AI 閱卷模型"), 
+                options=model_options,
+                index=default_index
+            )
+            
+            save_btn = st.form_submit_button(t("save_profile", "更新 Nexora 引擎設定"), type="primary")
+            
+            if save_btn:
+                uid = get_user_val("id")
+                # 1. 寫入資料庫
+                if update_user(uid, google_key=new_key.strip(), model_name=new_model):
+                    # 2. 【核心同步】解決金鑰存完讀不到的 Bug：強制更新當前 Session 物件
+                    if isinstance(st.session_state["user"], dict):
+                        st.session_state["user"]["google_key"] = new_key.strip()
+                        st.session_state["user"]["model_name"] = new_model
+                    else:
+                        st.session_state["user"].google_key = new_key.strip()
+                        st.session_state["user"].model_name = new_model
                     
-                    # 2. 更新資料庫路徑 (供 PDF 生成服務讀取)
-                    update_user(user.id, branding_logo_path=global_logo_path)
-                    
-                    st.success(t('msg_save_success'))
+                    st.success("✅ " + t("msg_save_success", "設定已儲存並立即生效！"))
+                    time.sleep(0.5)
                     st.rerun()
+                else:
+                    st.error("❌ 儲存失敗，請檢查資料庫連線。")
 
-            # --- Column 2: 文字設定 (URL & Running Head) ---
-            with c2:
-                st.subheader("Marketing & Header")
-                
-                # 讀取現有值
-                curr_url = getattr(user, 'custom_advertising_url', "") or ""
-                curr_header = getattr(user, 'custom_header_text', "") or ""
-                
-                # 輸入框
-                new_url = st.text_input(t('lbl_marketing_url'), value=curr_url, placeholder="https://...")
-                new_header = st.text_input(t('lbl_running_head'), value=curr_header, placeholder="e.g. 2026 Spring Exam")
+    # --- TAB 2: 個人資料與偏好 ---
+    with tab_profile:
+        st.markdown(f"### {t('settings_profile_header')}")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.text_input(t("lbl_username"), value=get_user_val("username"), disabled=True)
+            st.text_input(t("real_name"), value=get_user_val("real_name"), disabled=True)
+        with col2:
+            st.text_input(t("col_plan", "授權方案"), value="Nexora Professional (2026)", disabled=True)
+            
+        st.divider()
+        st.markdown("#### 🔒 修改登入密碼")
+        with st.expander("點擊展開密碼變更表單"):
+            with st.form("pwd_form"):
+                old_p = st.text_input("舊密碼", type="password")
+                new_p = st.text_input("新密碼", type="password")
+                if st.form_submit_button("變更密碼"):
+                    if login_user(get_user_val("username"), old_p):
+                        update_user(get_user_val("id"), password_hash=hash_password(new_p))
+                        st.success("密碼修改成功！")
+                    else:
+                        st.error("舊密碼驗證錯誤。")
 
-                # 儲存按鈕
-                if st.button(t('btn_save_branding')):
-                    if update_user(user.id, custom_advertising_url=new_url, custom_header_text=new_header):
-                        st.success(t('msg_save_success'))
-                        st.rerun()
-    
-    # =========================================================
-    # 3. 資料維護 (Maintenance) - 所有人可見
-    # =========================================================
-    with st.expander(f"🧹 {t('settings_maintenance')}", expanded=False):
-        st.warning(t('warn_maintenance'))
+    # --- TAB 3: 系統診斷資訊 ---
+    with tab_sys:
+        st.markdown(f"### {t('lbl_sys_info')}")
         
-        c_m1, c_m2 = st.columns(2)
+        # 顯示硬體指紋與軟體版本
+        diag_info = [
+            ("系統架構", "Nexora Intelligent Education Engine"),
+            ("當前模型", get_user_val("model_name")),
+            ("API 狀態", "已就緒 (Active)" if len(get_user_val("google_key")) > 10 else "未設定 (Inactive)"),
+            ("裝置指紋 (Machine ID)", get_fingerprint_for_ui()),
+            ("系統語系", st.session_state.get("lang", "zh_tw"))
+        ]
         
-        # 按鈕 1: 清除上傳暫存
-        if c_m1.button(t('btn_clear_uploads')):
-            folder = os.path.join(os.getcwd(), "uploaded_files")
-            if os.path.exists(folder):
-                try:
-                    count = 0
-                    for filename in os.listdir(folder):
-                        file_path = os.path.join(folder, filename)
-                        if os.path.isfile(file_path):
-                            os.unlink(file_path)
-                            count += 1
-                    st.toast(f"✅ Cleared {count} files from uploads.")
-                except Exception as e:
-                    st.error(f"Error: {e}")
-            else:
-                st.toast("✅ Upload folder is empty.")
+        with st.container(border=True):
+            for label, val in diag_info:
+                cl, cr = st.columns([1, 2])
+                cl.markdown(f"**{label}**")
+                cr.code(val, language=None)
         
-        # 按鈕 2: 清除輸出暫存 (Output)
-        if c_m2.button(t('btn_clear_outputs')):
-             # 假設輸出在 output 資料夾
-            folder = os.path.join(os.getcwd(), "output")
-            if os.path.exists(folder):
-                try:
-                    count = 0
-                    for filename in os.listdir(folder):
-                        file_path = os.path.join(folder, filename)
-                        if os.path.isfile(file_path):
-                            os.unlink(file_path)
-                            count += 1
-                    st.toast(f"✅ Cleared {count} files from output.")
-                except Exception as e:
-                    st.error(f"Error: {e}")
-            else:
-                 st.toast("✅ Output folder is empty.")
-
-    # 頁尾資訊
-    st.markdown("---")
-    plan_display = user.plan.upper() if user.plan else "UNKNOWN"
-    st.caption(f"User ID: {user.id} | Plan: {plan_display} | System: Release V1.0")
+        st.markdown("""
+            <div style='text-align:center; margin-top: 30px; opacity: 0.3;'>
+                Nexora Tools for Education © 2026 | Bridging Academic Heritage with Intelligent Technology
+            </div>
+        """, unsafe_allow_html=True)
