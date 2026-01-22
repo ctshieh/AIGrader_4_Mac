@@ -1,88 +1,114 @@
 # run_native.py
+# -*- coding: utf-8 -*-
 import sys
 import os
+import socket
 import threading
 import time
-import signal
-import socket
 import webview
+import traceback
+import signal
+import requests # 用於偵測服務狀態
 from streamlit.web import cli as stcli
 
-def get_resource_path(relative_path):
-    """ 取得 PyInstaller 環境下或開發環境下的絕對路徑 """
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+# ==============================================================================
+# 1. 環境變數設定
+# ==============================================================================
+os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
+os.environ["STREAMLIT_GLOBAL_DEVELOPMENT_MODE"] = "false"
+os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
+os.environ["STREAMLIT_THEME_BASE"] = "light"
+os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+os.environ["STREAMLIT_SERVER_ADDRESS"] = "127.0.0.1"
 
-def patch_signal():
-    """ 修正：讓背景線程中的 Streamlit 不再報錯 """
-    if threading.current_thread() is not threading.main_thread():
-        # 攔截訊號處理，避免背景線程崩潰
-        signal.signal = lambda s, f: None
-
-def is_port_open(port):
-    """ 偵測 127.0.0.1 的指定端口是否已啟用 """
+def get_free_port():
+    """ 獲取閒置 Port """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(('127.0.0.1', port)) == 0
+        s.bind(('', 0))
+        return s.getsockname()[1]
 
-def start_streamlit_background():
-    """在背景線程啟動 Streamlit Server"""
-    patch_signal() 
-    
-    main_script_path = get_resource_path("main.py")
-    
-    # [關鍵修正] 確保子進程環境變數包含 main.py 所在的資料夾
-    # 這能解決 Streamlit 啟動時找不到 app 模組的問題
-    base_dir = os.path.dirname(main_script_path)
-    os.environ["PYTHONPATH"] = base_dir + os.pathsep + os.environ.get("PYTHONPATH", "")
-    
+def wait_for_server(url, timeout=10):
+    """
+    🚀 極速啟動偵測：主動檢查 Streamlit 是否已就緒
+    不再傻傻等待固定秒數，只要伺服器一回應，視窗馬上開。
+    """
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            # 嘗試連線，只要有回應 (即使是 404) 都代表 Server 活著
+            requests.head(url, timeout=0.5)
+            return True
+        except requests.exceptions.ConnectionError:
+            time.sleep(0.1) # 每 0.1 秒檢查一次
+            continue
+    return False
+
+def run_streamlit_thread(port, script_path):
     sys.argv = [
-        "streamlit", 
-        "run", 
-        main_script_path, 
-        "--global.developmentMode=false", 
-        "--server.headless=true", 
-        "--server.port=8501",
+        "streamlit",
+        "run",
+        script_path,
+        f"--server.port={port}",
+        "--server.headless=true",
         "--server.address=127.0.0.1",
-        "--server.fileWatcherType=none",
-        "--browser.gatherUsageStats=false"
+        "--global.developmentMode=false",
     ]
+
+    # 屏蔽信號 (防止與 Webview 衝突)
+    original_signal = signal.signal
+    def dummy_signal(signum, handler): pass 
+    signal.signal = dummy_signal
 
     try:
         stcli.main()
+    except SystemExit:
+        pass 
     except Exception as e:
-        print(f"❌ Streamlit Error: {e}")
+        log_path = os.path.join(os.path.expanduser("~"), "Desktop", "streamlit_crash.log")
+        with open(log_path, "w") as f:
+            f.write(traceback.format_exc())
+    finally:
+        signal.signal = original_signal
 
 def start_app():
-    # 1. 啟動背景 Server
-    t = threading.Thread(target=start_streamlit_background)
+    # 1. 路徑校準
+    if getattr(sys, 'frozen', False):
+        base_dir = sys._MEIPASS
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    main_script = os.path.join(base_dir, "app.py")
+    
+    if not os.path.exists(main_script):
+        webview.create_window("Fatal Error", html=f"<h1>Error</h1><p>Missing: {main_script}</p>")
+        webview.start()
+        return
+
+    port = get_free_port()
+    target_url = f"http://127.0.0.1:{port}"
+
+    # --- 2. 啟動 Streamlit (背景) ---
+    t = threading.Thread(target=run_streamlit_thread, args=(port, main_script))
     t.daemon = True 
     t.start()
 
-    # 2. 智能偵測端口 (加速畫面開啟)
-    print("⏳ Detecting Streamlit Server (127.0.0.1:8501)...")
-    start_time = time.time()
-    max_wait = 20  # 最多等待 20 秒
-    
-    while time.time() - start_time < max_wait:
-        if is_port_open(8501):
-            print(f"✅ Server ready in {round(time.time() - start_time, 2)}s!")
-            break
+    # --- 3. 🚀 智慧等待 (取代 time.sleep) ---
+    # 偵測到 Port 通了才開視窗
+    if wait_for_server(target_url):
+        # 額外給 0.5 秒讓頁面渲染完成，避免看到全白瞬間
         time.sleep(0.5) 
+        
+        window = webview.create_window(
+            "AI Grader Pro", 
+            target_url,
+            width=1280, height=800,
+            confirm_close=True,
+            text_select=True
+        )
+        webview.start()
+    else:
+        webview.create_window("Error", html="<h1>Timeout</h1><p>Server failed to start.</p>")
+        webview.start()
 
-    # 3. 開啟 WebView 視窗
-    webview.create_window(
-        "AI Grader Pro",       
-        "http://127.0.0.1:8501", 
-        width=1280, 
-        height=850,
-        resizable=True,
-        confirm_close=True,
-        text_select=True
-    )
-    
-    webview.start()
-    sys.exit(0)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     start_app()

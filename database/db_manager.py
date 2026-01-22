@@ -185,6 +185,8 @@ class UserModel(Base):
     branding_logo_path = Column(Text)
     custom_advertising_url = Column(String)
     current_period_end = Column(DateTime)
+    # [新增此行]
+    last_active_at = Column(DateTime, nullable=True)
 
 class SessionModel(Base):
     __tablename__ = "sessions"
@@ -309,8 +311,77 @@ class PaymentRecordModel(Base):
 # ==============================================================================
 #  3. Core Functions
 # ==============================================================================
-
+####
 def init_db():
+    """
+    初始化資料庫並自動執行欄位遷移 (Migration)
+    """
+    # 1. 建立所有基本的資料表
+    Base.metadata.create_all(bind=engine)
+    
+    # 2. 執行欄位檢查與補齊 (防禦性編程)
+    with engine.connect() as conn:
+        commands = [
+            # --- [已有] 歷史遷移指令 ---
+            "ALTER TABLE users ADD COLUMN custom_page_limit INTEGER DEFAULT 0;",
+            "ALTER TABLE users ADD COLUMN custom_exam_limit INTEGER DEFAULT 0;",
+            "ALTER TABLE users ADD COLUMN branding_logo_path TEXT;",
+            "ALTER TABLE users ADD COLUMN custom_advertising_url TEXT;",
+            "ALTER TABLE users ADD COLUMN current_period_end TIMESTAMP;",
+            "ALTER TABLE usage_logs ADD COLUMN pages INTEGER DEFAULT 0;",
+            "ALTER TABLE exam_drafts ADD COLUMN content TEXT;",
+            "ALTER TABLE exam_drafts ADD COLUMN exam_id TEXT;",
+            "ALTER TABLE exam_drafts ADD COLUMN status TEXT DEFAULT 'draft';",
+            "ALTER TABLE exam_drafts ADD COLUMN academic_year TEXT;",
+            "ALTER TABLE exam_drafts ADD COLUMN department TEXT;",
+            "ALTER TABLE exam_drafts ADD COLUMN grade_level TEXT;",
+            "ALTER TABLE exam_drafts ADD COLUMN final_pdf_path TEXT;",
+            "ALTER TABLE exams ADD COLUMN academic_year TEXT;",
+            "ALTER TABLE exams ADD COLUMN semester TEXT;",
+            "ALTER TABLE exams ADD COLUMN exam_type TEXT;",
+            
+            # --- [NEW] 封堵時間漏洞所需的欄位 ---
+            "ALTER TABLE users ADD COLUMN last_active_at DATETIME;"
+        ]
+        
+        for cmd in commands:
+            try:
+                # 使用 text() 包裝字串，確保相容性
+                conn.execute(text(cmd))
+                conn.commit()
+            except Exception:
+                # 若欄位已存在，SQLite 會拋出錯誤，這裡直接跳過 (Pass)
+                pass
+
+    # 3. 管理員帳號初始化 (Admin User Init)
+    admin_user = os.getenv("ADMIN_USER", "admin")
+    admin_pass = os.getenv("ADMIN_PASS", "admin123")
+    
+    with SessionLocal() as session:
+        exists = session.query(UserModel).filter_by(username=admin_user).first()
+        if not exists:
+            # 確保 hash_password 函式已定義
+            ph = hash_password(admin_pass)
+            new_admin = UserModel(
+                username=admin_user,
+                email=f"{admin_user}@admin.local",
+                real_name="System Admin",
+                password_hash=ph,
+                is_approved=True,
+                is_admin=True,
+                plan='pro'
+            )
+            session.add(new_admin)
+            try:
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                print(f"Admin creation failed: {e}")
+
+####
+
+
+def init_db1():
     Base.metadata.create_all(bind=engine)
     with engine.connect() as conn:
         # [MIGRATION] Auto-add new archiving columns
@@ -740,24 +811,75 @@ def delete_user_batch(batch_id: str, user_id: int) -> bool:
             return True
         except: session.rollback(); return False
 
+# ==============================================================================
+# [NEW] 內部邏輯：計算用戶所在時區的「本週一 00:00」並轉為 UTC
+# ==============================================================================
+def _get_user_week_start_utc(session, user_id: int) -> datetime.datetime:
+    """
+    (Internal Helper) 
+    取得該用戶時區的「本週一 00:00:00」，並轉換為 UTC 時間供 DB 查詢。
+    """
+    try:
+        # 1. 查詢用戶設定的時區 (預設 Asia/Taipei)
+        user = session.get(UserModel, user_id)
+        tz_str = user.timezone if (user and user.timezone) else "Asia/Taipei"
+        user_tz = pytz.timezone(tz_str)
+
+        # 2. 取得當前 UTC 時間 (Aware)
+        now_utc = datetime.datetime.utcnow().replace(tzinfo=pytz.utc)
+
+        # 3. 轉為用戶當地時間
+        now_user = now_utc.astimezone(user_tz)
+
+        # 4. 回推到當地時間的「本週一 00:00:00」
+        # weekday(): 0=週一, 6=週日
+        days_diff = now_user.weekday()
+        start_of_week_user = now_user - datetime.timedelta(days=days_diff)
+        start_of_week_user = start_of_week_user.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # 5. 將該時間點轉回 UTC
+        start_of_week_utc = start_of_week_user.astimezone(pytz.utc)
+
+        # 6. 轉為 Naive datetime (移除時區標籤，因為 SQLite/SQLAlchemy 存的是 Naive UTC)
+        return start_of_week_utc.replace(tzinfo=None)
+
+    except Exception as e:
+        logger.error(f"Timezone calc error for user {user_id}: {e}")
+        # Fallback: 如果出錯，回退到 UTC 的週一 00:00
+        now = datetime.datetime.utcnow()
+        start = now - datetime.timedelta(days=now.weekday())
+        return start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+# ==============================================================================
+# [UPDATE] 保持函式名稱不變，但邏輯改為「週一重置」
+# ==============================================================================
+
 def get_user_weekly_page_count(user_id: int) -> int:
     with SessionLocal() as session:
         try:
-            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=7)
+            # 呼叫內部邏輯取得正確的 cutoff 時間
+            cutoff = _get_user_week_start_utc(session, user_id)
+            
             sql = text("SELECT SUM(pages) FROM usage_logs WHERE user_id = :uid AND created_at >= :start")
             result = session.execute(sql, {"uid": user_id, "start": cutoff}).scalar()
             return int(result) if result else 0
-        except: return 0
+        except Exception as e:
+            logger.error(f"Get page count error: {e}")
+            return 0
 
 def get_user_weekly_exam_gen_count(user_id: int) -> int:
     with SessionLocal() as session:
         try:
-            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=7)
+            # 呼叫內部邏輯取得正確的 cutoff 時間
+            cutoff = _get_user_week_start_utc(session, user_id)
+            
             sql = text("SELECT COUNT(*) FROM exams WHERE user_id = :uid AND created_at >= :start")
             result = session.execute(sql, {"uid": user_id, "start": cutoff}).scalar()
             return int(result) if result else 0
-        except: return 0
-
+        except Exception as e:
+            logger.error(f"Get exam count error: {e}")
+            return 0
+            
 def get_user_history_batches(user_id: int) -> pd.DataFrame:
     session = SessionLocal()
     try:
@@ -956,7 +1078,87 @@ def verify_otp_and_reset_password(username: str, otp: str, new_password: str) ->
         return True, "Success."
 
 # [FIX] Quota Check Implementation
+def get_verified_now():
+    """
+    [NEW] 取得經驗證的時間：優先使用網路時間，失敗則回退至系統時間
+    """
+    try:
+        # 使用 worldtimeapi，設定超時 1.5 秒以免影響使用者體驗
+        resp = requests.get("http://worldtimeapi.org/api/timezone/Etc/UTC", timeout=1.5)
+        if resp.status_code == 200:
+            data = resp.json()
+            return datetime.datetime.fromisoformat(data['datetime'].replace('Z', '+00:00')).replace(tzinfo=None)
+    except:
+        pass
+    # 沒網路時回退到系統時間 (配合下方的資料庫鎖定機制仍具防禦力)
+    return datetime.datetime.utcnow()
+
+#######
 def check_user_quota(user_id: int, current_plan: str, quota_type: str = "exam_gen") -> Tuple[bool, str]:
+    """
+    [ENHANCED] 強化版配額檢查：防止修改系統時間
+    """
+    session = SessionLocal()
+    try:
+        # 1. 取得經驗證的「現在時間」
+        verified_now = get_verified_now()
+        
+        # 2. 【防作弊檢查】讀取用戶最後活動時間
+        user = session.get(UserModel, user_id)
+        if user and user.last_active_at:
+            # 如果發現「現在時間」竟然比「最後活動時間」還要早，代表用戶調低了系統時間
+            if verified_now < user.last_active_at:
+                return False, "❌ 偵測到系統時間異常，請校正您的電腦時間。"
+
+        # 更新最後活動時間（存入資料庫作為標竿）
+        user.last_active_at = verified_now
+        session.commit()
+
+        # 3. 讀取方案設定
+        plan_config = get_plan_config(current_plan)
+        
+        if quota_type == "exam_gen":
+            limit = plan_config.get("exam_gen_quota", 30)
+            if current_plan == 'admin' or limit > 9999:
+                return True, "Unlimited"
+
+            # 使用驗證過的時間計算週一重置點
+            # 這裡呼叫您之前的 _get_user_week_start_utc，但內部改用 verified_now
+            cutoff = _get_user_week_start_utc_fixed(session, user_id, verified_now)
+            
+            sql = text("SELECT COUNT(*) FROM exams WHERE user_id = :uid AND created_at >= :start")
+            current_usage = session.execute(sql, {"uid": user_id, "start": cutoff}).scalar() or 0
+            
+            if current_usage >= limit:
+                return False, f"❌ 已超出每週配額 ({current_usage}/{limit})"
+                
+        return True, "OK"
+    except Exception as e:
+        logger.error(f"Quota check error: {e}")
+        return True, "Error bypassing" # 出錯時寬鬆處理或嚴格限制依您決定
+    finally:
+        session.close()
+ #######
+ 
+def _get_user_week_start_utc_fixed(session, user_id, base_now_utc):
+    """
+    修改原本的週一計算函式，使其接受外部傳入的 base_now_utc (驗證過的時間)
+    """
+    # 邏輯與之前一致，但將 datetime.datetime.utcnow() 換成 base_now_utc
+    user = session.get(UserModel, user_id)
+    tz_str = user.timezone if (user and user.timezone) else "Asia/Taipei"
+    user_tz = pytz.timezone(tz_str)
+    
+    # 將驗證過的 UTC 時間轉為用戶時區
+    now_user = base_now_utc.replace(tzinfo=pytz.utc).astimezone(user_tz)
+    start_of_week_user = now_user - datetime.timedelta(days=now_user.weekday())
+    start_of_week_user = start_of_week_user.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    return start_of_week_user.astimezone(pytz.utc).replace(tzinfo=None)
+ 
+ 
+###Any
+def check_user_quota1(user_id: int, current_plan: str, quota_type: str = "exam_gen") -> Tuple[bool, str]:
     """
     檢查用戶配額
     Args:
@@ -996,3 +1198,33 @@ def _ensure_dict(data):
     except:
         try: return ast.literal_eval(data)
         except: return {}
+
+# database/db_manager.py
+# (請保留原有的 imports 和其他函數，新增以下函數)
+
+def delete_unified_exam(unified_id: str, user_id: int) -> bool:
+    """
+    [NEW] 統一刪除函數：可處理 LEGACY_{id} 與 Draft UUID
+    """
+    session = SessionLocal()
+    try:
+        # 判斷是否為舊版資料 (LEGACY_ 開頭)
+        if str(unified_id).startswith("LEGACY_"):
+            try:
+                real_id = int(unified_id.replace("LEGACY_", ""))
+                # 刪除 exams 表
+                res = session.query(ExamModel).filter_by(id=real_id, user_id=user_id).delete()
+            except ValueError:
+                return False
+        else:
+            # 視為新版草稿，刪除 exam_drafts 表
+            res = session.query(ExamDraft).filter_by(exam_id=unified_id, user_id=user_id).delete()
+            
+        session.commit()
+        return res > 0
+    except Exception as e:
+        logger.error(f"Delete Unified Error: {e}")
+        session.rollback()
+        return False
+    finally:
+        session.close()

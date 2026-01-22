@@ -1,18 +1,16 @@
 # services/ai_generator.py
 # -*- coding: utf-8 -*-
-# Module-Version: v2026.01.22-Gemini-2.5-Native
+# Module-Version: v2026.01.26-Timeout-Unit-Fix
 # Description: 
-# 適配 2026 年環境：
-# 1. 使用 Google 官方新版 SDK 'google-genai'。
-# 2. 模型升級為 'gemini-2.5-flash' (棄用已下架的 1.5/2.0)。
-# 3. 強制 JSON Schema 輸出。
+# 1. [CRITICAL FIX] 修正 Timeout 單位錯誤。Google SDK 使用毫秒 (ms)，原設定 60 被視為 0.06秒導致秒斷。
+#    現改為 60000 (60秒)。
+# 2. [Logic] 保持文字/PDF 通用處理邏輯。
 
 import json
 import logging
 from io import BytesIO
 
 # [DEPENDENCY CHECK]
-# Env Check: pip install google-genai pypdf
 try:
     from google import genai
     from google.genai import types
@@ -39,13 +37,13 @@ def extract_text_from_pdf(pdf_bytes):
             content = page.extract_text()
             if content:
                 text += content + "\n"
-        return text if text else "[PDF 無法讀取文字，可能是掃描圖檔]"
+        return text if text else "[PDF Content Empty or Scanned Image]"
     except Exception as e:
         return f"Error reading PDF: {str(e)}"
 
 def generate_questions_from_material(api_key, material_text, config):
     """
-    呼叫 Gemini 2.5 API 生成題目
+    呼叫 Gemini 2.5 API 生成題目 (含防卡死機制)
     """
     if not HAS_GENAI:
         return {
@@ -54,80 +52,94 @@ def generate_questions_from_material(api_key, material_text, config):
         }
 
     try:
-        # 1. 初始化 Client (2026 Standard)
-        client = genai.Client(api_key=api_key)
+        # 1. 初始化 Client (關鍵修復：Timeout 單位修正)
+        # ⚠️ 注意：SDK 的 timeout 單位是「毫秒」(ms)
+        # 60000 ms = 60 秒
+        client = genai.Client(
+            api_key=api_key, 
+            http_options={'timeout': 60000} 
+        )
         
         # 2. 參數配置
-        q_type = config.get("q_type", "混合題型")
+        q_type = config.get("q_type", "Mixed")
         count = config.get("count", 5)
         diff = config.get("difficulty", "Medium")
         focus = config.get("focus_topic", "")
+        # 確保有預設語言，避免 None
+        target_lang = config.get("language", "Traditional Chinese (繁體中文)")
         score = config.get("score_per_q", 10)
         
         # 3. 構建 Prompt
         prompt = f"""
-        角色：你是一位嚴謹的學科命題老師。
-        任務：請根據[教材內容]，編寫 {count} 道 {diff} 程度的「{q_type}」。
+        Role: You are a strict academic exam creator for STEM subjects.
+        Task: Based on the provided [Source Material], create {count} questions of '{diff}' difficulty.
         
-        [教材內容]:
+        [Source Material]:
         {material_text[:15000]} ... (Truncated if too long)
         
-        [出題重點]:
+        [Focus Topic]:
         {focus}
 
-        [輸出格式 (Strict JSON)]:
-        請直接回傳一個 JSON Array，不要包含 Markdown 標記。
-        格式範例：
+        [Output Language Requirement]:
+        **CRITICAL**: Regardless of the source material's language, you MUST generate the Questions, Options, and Solutions in **{target_lang}**.
+        Ensure the terminology fits the local academic context of **{target_lang}**.
+
+        [Question Type]:
+        {q_type}
+
+        [Format Requirement (Strict JSON)]:
+        Return ONLY a JSON Array. No Markdown blocks.
+        Format Example:
         [
             {{
-                "text": "題目敘述 (數學公式用 LaTeX: $x^2$)",
-                "options": ["A", "B", "C", "D"],
-                "answer": "A",
-                "solution": "解析...",
+                "text": "Question text here (Use LaTeX for math: $x^2$)",
+                "options": ["Option A", "Option B", "Option C", "Option D"] (or null if not applicable),
+                "answer": "Correct Answer",
+                "solution": "Step-by-step explanation in {target_lang}...",
                 "type": "{q_type}",
                 "score": {score}
             }}
         ]
         """
 
-        # 4. 設定模型與參數
-        # [UPDATE 2026] 1.5/2.0 已過時，改用 gemini-2.5-flash
+        # 4. 設定模型
         model_id = "gemini-2.5-flash" 
 
+        # 5. 發送請求
         response = client.models.generate_content(
             model=model_id,
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.7,
-                # 2026 年的模型通常支援較大的 context，可適度放寬 token 限制
                 max_output_tokens=8192 
             )
         )
 
-        # 5. 解析回傳資料
+        # 6. 解析回傳資料
         raw_content = response.text
         
-        # 雖然指定了 JSON MIME，但仍做基礎清理以防萬一
+        # 移除可能的 Markdown 標記
         if raw_content.startswith("```json"):
             raw_content = raw_content.replace("```json", "").replace("```", "")
         
-        questions = json.loads(raw_content)
+        try:
+            questions = json.loads(raw_content)
+        except json.JSONDecodeError:
+            return {"success": False, "error": "AI 回傳了無效的 JSON 格式，請重試。"}
         
         # 容錯處理：如果模型回傳了 {"questions": [...]} 結構
         if isinstance(questions, dict):
-            # 嘗試尋找可能是列表的 key
             for key, val in questions.items():
                 if isinstance(val, list):
                     questions = val
                     break
             
         if not isinstance(questions, list):
-            # 如果還是字典且找不到列表，可能是單題
             if isinstance(questions, dict) and "text" in questions:
                 questions = [questions]
             else:
-                return {"success": False, "error": "AI 回傳格式不符 (需為 JSON Array)"}
+                return {"success": False, "error": "AI response format error (List expected)"}
 
         return {
             "success": True,
@@ -135,13 +147,20 @@ def generate_questions_from_material(api_key, material_text, config):
         }
 
     except Exception as e:
-        # 錯誤捕捉：包含模型不存在的錯誤 (404 Not Found)
         err_msg = str(e)
+        # 捕捉 Timeout 錯誤並提供友善提示
+        if "timeout" in err_msg.lower() or "timed out" in err_msg.lower():
+            return {
+                "success": False,
+                "error": "⏳ AI 回應逾時 (Timeout)。這通常是網路連線不穩或 Google API 暫時壅塞，請稍後再試。"
+            }
+            
         if "404" in err_msg or "Not Found" in err_msg:
             return {
                 "success": False,
-                "error": f"Model '{model_id}' not found. Please check API availability in 2026 region."
+                "error": f"Model '{model_id}' not found. Please check API availability."
             }
+            
         return {
             "success": False, 
             "error": f"AI Error: {err_msg}"

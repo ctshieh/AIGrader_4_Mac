@@ -27,6 +27,57 @@ class ExamBuilder:
         self.logger = logging.getLogger(__name__)
 
     def _get_font_config(self):
+    """
+    [Font Strategy]
+    偵測字型路徑，支援子目錄遞迴搜尋，確保 ~/Library/Fonts 也能抓到。
+    """
+    if getattr(sys, 'frozen', False):
+        application_path = os.path.dirname(sys.executable)
+    else:
+        application_path = os.getcwd()
+        
+    local_fonts_dir = os.path.join(application_path, "fonts")
+
+    cwtex_targets = {
+        "main": "cwTeXQMing-Medium.ttf",
+        "sans": "cwTeXQHei-Bold.ttf",
+        "mono": "cwTeXQYuan-Medium.ttf"
+    }
+
+    # 定義基礎搜尋路徑
+    base_search_paths = [
+        local_fonts_dir,
+        os.path.expanduser("~/Library/Fonts"), # [新增] macOS 用戶路徑
+        "/Library/Fonts",                      # macOS 系統路徑
+        "/usr/share/fonts",                    # Linux 系統路徑
+        os.path.expanduser("~/.local/share/fonts") # Linux 用戶路徑
+    ]
+    
+    # 如果是 Windows，加入 Windows 字型路徑
+    if platform.system() == "Windows":
+        base_search_paths.append(os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts'))
+
+    found_fonts = {}
+
+    # 執行遞迴搜尋
+    for key, filename in cwtex_targets.items():
+        font_path = None
+        for base_path in base_search_paths:
+            if not os.path.exists(base_path):
+                continue
+            
+            # [NEW] 使用 os.walk 進行子目錄遞迴搜尋
+            for root, dirs, files in os.walk(base_path):
+                if filename in files:
+                    font_path = os.path.join(root, filename)
+                    break
+            if font_path: break
+        
+        # 存入找到的絕對路徑，若找不到則保留檔名讓系統回退 (Fallback)
+        found_fonts[key] = font_path if font_path else filename
+
+    return found_fonts
+    def _get_font_config2(self):
         """
         [Font Strategy]
         偵測字型路徑，支援 Windows/Mac/Linux 的 Portable 模式與安裝模式。

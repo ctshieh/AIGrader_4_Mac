@@ -1,24 +1,38 @@
-# Copyright (c) 2026 [謝忠村/Chung Tsun Shieh]. All Rights Reserved.
 # ui/my_exams_view.py
 # -*- coding: utf-8 -*-
-# Module-Version: v2026.01.22-Callback-Fix
+# Module-Version: v2026.01.26-Fix-Nav-Delete
 # Description: 
-# [Fix] Solved StreamlitAPIException by using on_click callback for page navigation.
+# 1. [Fix] 修復「導入編輯」無法跳轉的問題 (修正 Session 變數名稱)。
+# 2. [Feat] 新增「刪除」按鈕，支援舊版與新版草稿刪除。
 
 import streamlit as st
-import json
 import time
-from database.db_manager import get_user_exams_unified, get_exam_by_id
+from database.db_manager import get_user_exams_unified, delete_unified_exam
 from utils.localization import t
 
 def load_exam_to_editor(exam_id):
     """
-    [Callback Function]
-    這會在按鈕按下後、頁面重繪前執行。
-    此時修改 page_selection 是安全的。
+    [Callback] 觸發導入編輯
     """
-    st.session_state['loader_selected_id'] = exam_id # 標記要載入的試卷 ID
-    st.session_state.page_selection = "menu_exam_gen" # 切換頁面
+    # 1. 設定要載入的 ID
+    st.session_state['loader_selected_id'] = exam_id
+    
+    # 2. [CRITICAL FIX] 強制切換頁面
+    # 必須使用 page_selection_clean 並且值必須等於選單上的顯示名稱 (翻譯後)
+    # 這樣 app_core.py 才會偵測到變化並切換
+    target_page_name = t("menu_exam_gen") 
+    st.session_state.page_selection_clean = target_page_name
+
+def handle_delete(exam_id, user_id):
+    """
+    [Callback] 執行刪除
+    """
+    success = delete_unified_exam(exam_id, user_id)
+    if success:
+        st.toast(f"✅ {t('msg_deleted', '已刪除')}", icon="🗑️")
+        time.sleep(0.5) # 稍作停頓讓 Toast 顯示
+    else:
+        st.toast(f"❌ {t('err_save_failed', '刪除失敗')}", icon="⚠️")
 
 def render_my_exams_view(user):
     st.title(f"🗂️ {t('menu_my_exams', '我的試卷庫')}")
@@ -27,20 +41,21 @@ def render_my_exams_view(user):
     all_exams = get_user_exams_unified(user.id)
 
     if not all_exams:
-        st.info("尚無試卷存檔。請前往「試卷生成」建立第一份試卷！")
+        st.info(t('msg_no_sets', "尚無試卷存檔。"))
         return
 
-    # 2. 建立樹狀結構
+    # 2. 建立分類樹 (科目 -> 年份 -> 學期 -> 類型)
     tree = {}
     for e in all_exams:
-        subj = e.get('subject') or "未分類科目"
-        year = e.get('academic_year')
-        if not year:
-            try: year = e['content']['meta']['year']
-            except: year = "未分類年份"
-            
-        sem = e.get('semester') or "未分類學期"
-        etype = e.get('exam_type') or "未分類型態"
+        # 處理資料欄位可能的缺失
+        header = e.get('content', {}).get('header', {})
+        
+        subj = e.get('subject') or header.get('subject') or "未分類科目"
+        
+        # 優先使用外層欄位，若無則找 content 內層
+        year = e.get('academic_year') or header.get('academic_year') or "未分類年份"
+        sem = e.get('semester') or header.get('semester') or "未分類學期"
+        etype = e.get('exam_type') or header.get('exam_type') or "未分類型態"
         
         if subj not in tree: tree[subj] = {}
         if year not in tree[subj]: tree[subj][year] = {}
@@ -53,7 +68,7 @@ def render_my_exams_view(user):
     for subj, years in sorted(tree.items()):
         with st.expander(f"📚 {subj}", expanded=True):
             for year, sems in sorted(years.items(), reverse=True):
-                st.markdown(f"### 📅 {year} 學年度")
+                st.markdown(f"### 📅 {year}")
                 for sem, types in sorted(sems.items()):
                     st.markdown(f"**🔹 {sem}**")
                     for etype, exams in sorted(types.items()):
@@ -61,20 +76,36 @@ def render_my_exams_view(user):
                         
                         for exam in exams:
                             with st.container():
-                                col_info, col_act = st.columns([3, 1])
+                                c_info, c_edit, c_del = st.columns([6, 2, 1])
                                 
-                                with col_info:
-                                    status_icon = "🟢" if exam.get('source') == "legacy" else "🟡"
-                                    st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{status_icon} **{exam['title']}**")
-                                    st.caption(f"&nbsp;&nbsp;&nbsp;&nbsp;最後更新: {exam['updated_at']}")
+                                # A. 資訊欄
+                                with c_info:
+                                    is_legacy = exam.get('source') == "legacy"
+                                    icon = "🔒" if is_legacy else "📄"
+                                    source_text = "(舊版存檔)" if is_legacy else ""
+                                    
+                                    st.markdown(f"#### {icon} {exam['title']} {source_text}")
+                                    st.caption(f"Update: {exam['updated_at']}")
                                 
-                                with col_act:
-                                    # [FIX] 改用 on_click 機制
-                                    # 注意：args 必須是 tuple，所以單一參數後面要加逗號 (exam['id'],)
+                                # B. 導入編輯按鈕
+                                with c_edit:
                                     st.button(
-                                        "♻️ 導入編輯", 
-                                        key=f"clone_{exam['id']}",
+                                        f"✏️ {t('lbl_select_edit', '導入編輯')}", 
+                                        key=f"edit_{exam['id']}",
                                         on_click=load_exam_to_editor,
-                                        args=(exam['id'],)
+                                        args=(exam['id'],),
+                                        use_container_width=True,
+                                        type="primary"
+                                    )
+                                
+                                # C. 刪除按鈕 (本次新增)
+                                with c_del:
+                                    st.button(
+                                        "🗑️", 
+                                        key=f"del_{exam['id']}",
+                                        on_click=handle_delete,
+                                        args=(exam['id'], user.id),
+                                        type="secondary",
+                                        help="刪除此試卷"
                                     )
                         st.markdown("---")

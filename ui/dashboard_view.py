@@ -434,7 +434,7 @@ def render_step_2_grading(user):
                             label_cursor = 0 
                             full_layout_list = []
                             for page_idx, page_img in enumerate(imgs):
-                                cv_img = cv2.cvtColor(np.array(page_img), cv2.COLOR_BGR2BGR)
+                                cv_img = cv2.cvtColor(np.array(page_img), cv2.COLOR_RGB2BGR)
                                 aligned = VisionService.align_document(cv_img)
                                 is_p1 = (page_idx == 0)
                                 boxes, cutoff = VisionService.detect_answer_areas(aligned, is_first_page=is_p1, manual_p1_ratio=man_ratio)
